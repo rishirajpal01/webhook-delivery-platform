@@ -37,17 +37,20 @@ jobs:
       - name: Test
         run: make test
 
-  # Exit gate for phase 0: the stack comes up from a clean checkout.
+  # The stack comes up from a clean checkout and delivers a signed webhook.
   compose:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Start stack
-        run: docker compose up --build -d --wait
+        # No random failures here, so the end-to-end check is deterministic.
+        run: MOCK_FAIL_RATE=0 docker compose up --build -d --wait
       - name: Check health
         run: |
           curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://localhost:8080/readyz
           curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://localhost:9000/healthz
+      - name: Send a webhook end to end
+        run: scripts/demo.sh
       - name: Logs on failure
         if: failure()
         run: docker compose logs
