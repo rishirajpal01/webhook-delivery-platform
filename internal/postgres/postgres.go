@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 )
@@ -22,12 +23,23 @@ var migrationFiles embed.FS
 // same in every process.
 const migrateLockID = 7_202_610_11
 
+// maxConns caps connections per process. It sits above the default
+// dispatcher concurrency (16) so API requests still get connections while
+// every dispatcher slot is busy.
+const maxConns = 40
+
 // Open connects to Postgres and checks the connection works.
 func Open(ctx context.Context, url string) (*sql.DB, error) {
 	db, err := sql.Open("pgx", url)
 	if err != nil {
 		return nil, err
 	}
+	// database/sql keeps only 2 idle connections by default, so a busy
+	// dispatcher would open and close a Postgres connection (a new backend
+	// process) for most queries. Keep a steady pool instead.
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)

@@ -2,53 +2,17 @@ package postgres
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"io/fs"
-	"net/url"
-	"os"
 	"sync"
 	"testing"
+
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/testdb"
 )
 
-// testDB creates a throwaway database for one test and drops it afterwards.
-// It skips the test when DATABASE_URL is unset, so `go test ./...` still
-// works without Postgres.
+// testDB returns a fresh, unmigrated database.
 func testDB(t *testing.T) *sql.DB {
-	t.Helper()
-	base := os.Getenv("DATABASE_URL")
-	if base == "" {
-		t.Skip("DATABASE_URL not set; skipping Postgres test")
-	}
-	ctx := context.Background()
-
-	admin, err := Open(ctx, base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { admin.Close() })
-
-	b := make([]byte, 6)
-	rand.Read(b)
-	name := "test_" + hex.EncodeToString(b)
-	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
-		t.Fatal(err)
-	}
-
-	u, err := url.Parse(base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.Path = "/" + name
-	db, err := Open(ctx, u.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		db.Close()
-		admin.ExecContext(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-	})
+	db, _ := testdb.New(t)
 	return db
 }
 
