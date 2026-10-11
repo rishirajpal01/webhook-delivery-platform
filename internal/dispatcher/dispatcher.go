@@ -1,0 +1,302 @@
+// Package dispatcher sends due deliveries and records the outcome.
+//
+// A dispatcher claims due rows with a lease, sends each one outside any
+// transaction, then records the attempt and the next state. If it dies
+// mid-send the lease expires, a sweeper puts the row back to pending, and
+// some dispatcher sends it again. That is why delivery is at-least-once.
+package dispatcher
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"log/slog"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/postgres"
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/signing"
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/ssrf"
+)
+
+// maxResponseBody is how much of a receiver's response is kept in the
+// attempt log.
+const maxResponseBody = 4 << 10
+
+var (
+	attemptsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "webhookd_delivery_attempts_total",
+		Help: "Delivery attempts by outcome: succeeded, retry or dead.",
+	}, []string{"outcome"})
+	attemptDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "webhookd_delivery_attempt_duration_seconds",
+		Help:    "Time from sending a request to receiving the response or an error.",
+		Buckets: prometheus.ExponentialBuckets(0.005, 2, 13), // 5ms to ~20s
+	})
+	deliveryLag = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "webhookd_delivery_lag_seconds",
+		Help:    "Time from a delivery becoming due to a dispatcher claiming it.",
+		Buckets: prometheus.ExponentialBuckets(0.01, 2, 16), // 10ms to ~5.5min
+	})
+	inFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "webhookd_deliveries_in_flight",
+		Help: "Deliveries this process is sending right now.",
+	})
+)
+
+// Config tunes a dispatcher. Zero values take the defaults noted.
+type Config struct {
+	Concurrency    int             // parallel sends per process; default 16
+	PollInterval   time.Duration   // wait when no work is due; default 250ms
+	Lease          time.Duration   // how long a claim is held; default 30s
+	RequestTimeout time.Duration   // per HTTP request; default 15s
+	Schedule       []time.Duration // retry delays; default DefaultSchedule
+	// AllowPrivateNetworks turns off the SSRF guard. Local development only.
+	AllowPrivateNetworks bool
+}
+
+func (c *Config) setDefaults() {
+	if c.Concurrency <= 0 {
+		c.Concurrency = 16
+	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = 250 * time.Millisecond
+	}
+	if c.RequestTimeout <= 0 {
+		c.RequestTimeout = 15 * time.Second
+	}
+	if c.Lease <= 0 {
+		c.Lease = 30 * time.Second
+	}
+	if c.Schedule == nil {
+		c.Schedule = DefaultSchedule
+	}
+}
+
+// Dispatcher claims and sends deliveries.
+type Dispatcher struct {
+	store     *postgres.Store
+	cfg       Config
+	client    *http.Client
+	logger    *slog.Logger
+	rnd       func() float64
+	slotFreed chan struct{}
+}
+
+// New returns a dispatcher. Call Run to start it.
+func New(store *postgres.Store, cfg Config, logger *slog.Logger) *Dispatcher {
+	cfg.setDefaults()
+	return &Dispatcher{
+		store:     store,
+		cfg:       cfg,
+		client:    newHTTPClient(cfg.RequestTimeout, cfg.Concurrency, cfg.AllowPrivateNetworks),
+		logger:    logger,
+		rnd:       rand.Float64,
+		slotFreed: make(chan struct{}, 1),
+	}
+}
+
+func newHTTPClient(timeout time.Duration, concurrency int, allowPrivate bool) *http.Client {
+	dialer := ssrf.NewDialer(5*time.Second, allowPrivate)
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:             nil, // a proxy would connect on our behalf and bypass the SSRF check
+			DialContext:       dialer.DialContext,
+			ForceAttemptHTTP2: true,
+			// Up to every slot may be sending to one host; keep those
+			// connections for reuse instead of reconnecting each time.
+			MaxIdleConnsPerHost:   concurrency,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: timeout,
+		},
+		// Redirects are not followed: a 3xx counts as a failure. Following
+		// them would let a receiver point us at an address it chose later.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+// Run claims and sends deliveries until ctx is cancelled, then waits for the
+// sends already started to finish (each is bounded by RequestTimeout).
+func (d *Dispatcher) Run(ctx context.Context) error {
+	d.logger.Info("dispatcher started", "concurrency", d.cfg.Concurrency, "lease", d.cfg.Lease.String())
+	sem := make(chan struct{}, d.cfg.Concurrency)
+	done := make(chan struct{})
+	defer func() {
+		// Fill every slot: this returns once all running sends are done.
+		for range cap(sem) {
+			sem <- struct{}{}
+		}
+		<-done
+		d.logger.Info("dispatcher stopped")
+	}()
+
+	go func() {
+		defer close(done)
+		d.releaseExpiredLoop(ctx)
+	}()
+
+	for ctx.Err() == nil {
+		// Only this loop adds to sem, so `free` slots are guaranteed free.
+		free := cap(sem) - len(sem)
+		if free == 0 {
+			select {
+			case <-ctx.Done():
+			case <-d.slotFreed:
+			}
+			continue
+		}
+
+		jobs, err := d.store.Claim(ctx, free, d.cfg.Lease)
+		if err != nil {
+			if ctx.Err() == nil {
+				d.logger.Error("claim failed", "err", err)
+			}
+			sleep(ctx, d.cfg.PollInterval)
+			continue
+		}
+		claimedAt := time.Now()
+		for _, j := range jobs {
+			deliveryLag.Observe(claimedAt.Sub(j.DueAt).Seconds())
+			sem <- struct{}{}
+			go func() {
+				defer func() {
+					<-sem
+					select {
+					case d.slotFreed <- struct{}{}:
+					default:
+					}
+				}()
+				d.process(context.WithoutCancel(ctx), j)
+			}()
+		}
+		if len(jobs) < free {
+			sleep(ctx, d.cfg.PollInterval)
+		}
+	}
+	return nil
+}
+
+func (d *Dispatcher) releaseExpiredLoop(ctx context.Context) {
+	interval := max(d.cfg.Lease/3, time.Second)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		n, err := d.store.ReleaseExpired(ctx)
+		if err != nil && ctx.Err() == nil {
+			d.logger.Error("release expired leases failed", "err", err)
+		}
+		if n > 0 {
+			d.logger.Warn("released expired leases", "count", n)
+		}
+	}
+}
+
+// process sends one delivery and records the result. ctx is not cancelled
+// on shutdown, so a send in progress is finished rather than abandoned.
+func (d *Dispatcher) process(ctx context.Context, j postgres.Job) {
+	inFlight.Inc()
+	defer inFlight.Dec()
+
+	attempt := d.send(ctx, j)
+	ok := attempt.StatusCode != nil && *attempt.StatusCode >= 200 && *attempt.StatusCode < 300
+
+	o := postgres.Outcome{Attempt: attempt}
+	switch delay, retry := retryDelay(d.cfg.Schedule, j.AttemptCount+1, d.rnd); {
+	case ok:
+		o.NextState = postgres.DeliverySucceeded
+	case retry:
+		o.NextState = postgres.DeliveryPending
+		o.RetryAt = time.Now().Add(delay)
+	default:
+		o.NextState = postgres.DeliveryDead
+	}
+
+	outcome := map[string]string{
+		postgres.DeliverySucceeded: "succeeded",
+		postgres.DeliveryPending:   "retry",
+		postgres.DeliveryDead:      "dead",
+	}[o.NextState]
+	attemptsTotal.WithLabelValues(outcome).Inc()
+
+	log := d.logger.With("delivery_id", j.DeliveryID, "message_id", j.MessageID,
+		"endpoint_id", j.EndpointID, "attempt", j.AttemptCount+1, "outcome", outcome)
+	if !ok {
+		log.Info("delivery attempt failed", "status", attempt.StatusCode, "err", attempt.Error)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	changed, err := d.store.Complete(ctx, j, o)
+	switch {
+	case err != nil:
+		// The lease will expire and the delivery will be sent again.
+		log.Error("recording attempt failed", "err", err)
+	case !changed:
+		log.Warn("lease was lost before the attempt was recorded; another dispatcher owns the delivery")
+	}
+}
+
+// send makes one signed HTTP request and describes what happened.
+func (d *Dispatcher) send(ctx context.Context, j postgres.Job) postgres.Attempt {
+	start := time.Now()
+	a := postgres.Attempt{DeliveryID: j.DeliveryID, AttemptedAt: start}
+	fail := func(err error) postgres.Attempt {
+		a.LatencyMS = int(time.Since(start).Milliseconds())
+		a.Error = err.Error()
+		attemptDuration.Observe(time.Since(start).Seconds())
+		return a
+	}
+
+	sig, err := signing.Sign(j.Secret, j.MessageID, start, j.Payload)
+	if err != nil {
+		return fail(err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, j.URL, bytes.NewReader(j.Payload))
+	if err != nil {
+		return fail(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "webhookd")
+	req.Header.Set(signing.HeaderID, j.MessageID)
+	req.Header.Set(signing.HeaderTimestamp, strconv.FormatInt(start.Unix(), 10))
+	req.Header.Set(signing.HeaderSignature, sig)
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return fail(err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	// Drain a little more so the connection can be reused, then close.
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+
+	a.LatencyMS = int(time.Since(start).Milliseconds())
+	attemptDuration.Observe(time.Since(start).Seconds())
+	code := resp.StatusCode
+	a.StatusCode = &code
+	// Postgres text cannot hold invalid UTF-8 or NUL bytes.
+	a.ResponseBody = strings.ReplaceAll(string(bytes.ToValidUTF8(body, []byte("\uFFFD"))), "\x00", "")
+	return a
+}
+
+func sleep(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
