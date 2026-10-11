@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -54,8 +55,9 @@ func TestHealthRoutes(t *testing.T) {
 
 // client calls the handler with the API key.
 type client struct {
-	t *testing.T
-	h http.Handler
+	t  *testing.T
+	h  http.Handler
+	db *sql.DB // for setting up states the API cannot reach directly
 }
 
 func newClient(t *testing.T) client {
@@ -63,7 +65,7 @@ func newClient(t *testing.T) client {
 	if _, err := postgres.Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	return client{t: t, h: NewHandler(db, postgres.NewStore(db), testKey, discard)}
+	return client{t: t, h: NewHandler(db, postgres.NewStore(db), testKey, discard), db: db}
 }
 
 // do sends a request and decodes the JSON response into out (if non-nil).
@@ -188,6 +190,12 @@ func TestValidationAndNotFound(t *testing.T) {
 		{"attempts of missing delivery", "GET", base + "/deliveries/del_x/attempts", "", 404},
 		{"bad limit", "GET", base + "/endpoints?limit=500", "", 400},
 		{"list endpoints of missing app", "GET", "/v1/apps/app_missing/endpoints", "", 404},
+		{"replay missing delivery", "POST", base + "/deliveries/del_x/replay", "", 404},
+		{"replay endpoint without since", "POST", base + "/endpoints/ep_x/replay", `{}`, 422},
+		{"replay endpoint with bad since", "POST", base + "/endpoints/ep_x/replay", `{"since":"yesterday"}`, 400},
+		{"replay missing endpoint", "POST", base + "/endpoints/ep_x/replay", `{"since":"2026-01-01T00:00:00Z"}`, 404},
+		{"rotate with bad secret", "POST", base + "/endpoints/ep_x/secret/rotate", `{"secret":"hunter2"}`, 422},
+		{"rotate missing endpoint", "POST", base + "/endpoints/ep_x/secret/rotate", "", 404},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -214,4 +222,50 @@ func TestValidationAndNotFound(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c.h.ServeHTTP(rec, req)
 	c.expect(rec, http.StatusUnauthorized)
+}
+
+func TestReplayAndRotate(t *testing.T) {
+	c := newClient(t)
+	var app postgres.App
+	c.expect(c.do("POST", "/v1/apps", `{"name":"acme"}`, &app), http.StatusCreated)
+	base := "/v1/apps/" + app.ID
+	var ep postgres.Endpoint
+	c.expect(c.do("POST", base+"/endpoints", `{"url":"https://example.com/hook"}`, &ep), http.StatusCreated)
+	var sent struct{ ID string }
+	c.expect(c.do("POST", base+"/messages", `{"event_type":"a","payload":{}}`, &sent), http.StatusAccepted)
+	var ds list[postgres.Delivery]
+	c.expect(c.do("GET", base+"/messages/"+sent.ID+"/deliveries", "", &ds), http.StatusOK)
+	del := base + "/deliveries/" + ds.Data[0].ID + "/replay"
+
+	// A pending delivery is still being worked on.
+	c.expect(c.do("POST", del, "", nil), http.StatusConflict)
+
+	if _, err := c.db.Exec(`UPDATE deliveries SET state = 'dead', attempt_count = 10`); err != nil {
+		t.Fatal(err)
+	}
+	var d postgres.Delivery
+	c.expect(c.do("POST", del, "", &d), http.StatusAccepted)
+	if d.State != "pending" || d.AttemptCount != 0 || d.MessageID != sent.ID {
+		t.Fatalf("replayed delivery = %+v", d)
+	}
+
+	if _, err := c.db.Exec(`UPDATE deliveries SET state = 'dead'`); err != nil {
+		t.Fatal(err)
+	}
+	var replayed struct{ Replayed int }
+	c.expect(c.do("POST", base+"/endpoints/"+ep.ID+"/replay", `{"since":"2000-01-01T00:00:00Z"}`, &replayed), http.StatusAccepted)
+	if replayed.Replayed != 1 {
+		t.Fatalf("replayed = %d, want 1", replayed.Replayed)
+	}
+
+	var rotated postgres.Endpoint
+	c.expect(c.do("POST", base+"/endpoints/"+ep.ID+"/secret/rotate", "", &rotated), http.StatusOK)
+	if !strings.HasPrefix(rotated.Secret, "whsec_") || rotated.Secret == ep.Secret {
+		t.Fatalf("rotated secret = %q, want a new one", rotated.Secret)
+	}
+	const chosen = "whsec_bmV3c2VjcmV0bmV3c2VjcmV0"
+	c.expect(c.do("POST", base+"/endpoints/"+ep.ID+"/secret/rotate", `{"secret":"`+chosen+`"}`, &rotated), http.StatusOK)
+	if rotated.Secret != chosen {
+		t.Fatalf("rotated secret = %q, want %q", rotated.Secret, chosen)
+	}
 }

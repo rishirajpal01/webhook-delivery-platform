@@ -55,9 +55,12 @@ func NewHandler(db Pinger, store *postgres.Store, apiKey string, logger *slog.Lo
 	v1.HandleFunc("GET /v1/apps/{app}/endpoints/{ep}", s.getEndpoint)
 	v1.HandleFunc("PATCH /v1/apps/{app}/endpoints/{ep}", s.updateEndpoint)
 	v1.HandleFunc("DELETE /v1/apps/{app}/endpoints/{ep}", s.deleteEndpoint)
+	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/secret/rotate", s.rotateSecret)
+	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/replay", s.replayEndpoint)
 	v1.HandleFunc("POST /v1/apps/{app}/messages", s.sendMessage)
 	v1.HandleFunc("GET /v1/apps/{app}/messages/{msg}/deliveries", s.listDeliveries)
 	v1.HandleFunc("GET /v1/apps/{app}/deliveries/{del}/attempts", s.listAttempts)
+	v1.HandleFunc("POST /v1/apps/{app}/deliveries/{del}/replay", s.replayDelivery)
 	mux.Handle("/v1/", s.requireKey(v1))
 
 	return mux
@@ -99,6 +102,10 @@ func (s *server) requireKey(next http.Handler) http.Handler {
 func (s *server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, postgres.ErrNotFound) {
 		problem(w, http.StatusNotFound, "not found")
+		return
+	}
+	if errors.Is(err, postgres.ErrConflict) {
+		problem(w, http.StatusConflict, "only dead or succeeded deliveries can be replayed")
 		return
 	}
 	s.logger.Error("request failed", "method", r.Method, "path", r.URL.Path, "err", err)

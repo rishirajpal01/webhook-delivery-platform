@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -176,6 +177,53 @@ func (s *server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// rotationOverlap is how long the old secret keeps signing requests after
+// a rotation, so receivers have a day to switch over.
+const rotationOverlap = 24 * time.Hour
+
+func (s *server) rotateSecret(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Secret string `json:"secret"`
+	}
+	if r.ContentLength != 0 && !decode(w, r, &req) { // the body is optional
+		return
+	}
+	if req.Secret == "" {
+		req.Secret = signing.NewSecret()
+	} else if !signing.ValidSecret(req.Secret) {
+		problem(w, http.StatusUnprocessableEntity, "secret must be whsec_ followed by base64 of at least 16 bytes")
+		return
+	}
+	ep, err := s.store.RotateSecret(r.Context(), r.PathValue("app"), r.PathValue("ep"), req.Secret, rotationOverlap)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	// Like on create, the new secret is returned once, here.
+	writeJSON(w, http.StatusOK, ep)
+}
+
+// replayEndpoint redelivers every dead delivery to the endpoint created at
+// or after "since", e.g. after the receiver's outage is fixed.
+func (s *server) replayEndpoint(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Since *time.Time `json:"since"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Since == nil {
+		problem(w, http.StatusUnprocessableEntity, "since is required (RFC 3339 time)")
+		return
+	}
+	n, err := s.store.ReplayEndpoint(r.Context(), r.PathValue("app"), r.PathValue("ep"), *req.Since)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]int{"replayed": n})
+}
+
 // --- messages ---
 
 func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
@@ -235,6 +283,17 @@ func (s *server) listAttempts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, list[postgres.Attempt]{Data: as})
+}
+
+// replayDelivery sends a dead or succeeded delivery again, with the same
+// webhook-id, starting a fresh retry schedule.
+func (s *server) replayDelivery(w http.ResponseWriter, r *http.Request) {
+	d, err := s.store.ReplayDelivery(r.Context(), r.PathValue("app"), r.PathValue("del"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, d)
 }
 
 // --- validation ---
