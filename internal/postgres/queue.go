@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -16,6 +18,12 @@ type Job struct {
 	Payload      []byte
 	URL          string
 	Secret       string
+	// PreviousSecret is set while a rotated-out secret is still valid; the
+	// request is then signed with both.
+	PreviousSecret string
+	// Probe is true when this delivery tests an endpoint whose circuit
+	// breaker is open.
+	Probe bool
 	// LockedUntil is the lease this claim holds. It doubles as a fencing
 	// token: Complete only applies if the row still carries this exact lease.
 	LockedUntil time.Time
@@ -23,28 +31,82 @@ type Job struct {
 
 // Claim leases up to limit due deliveries for lease. Rows locked by another
 // dispatcher are skipped rather than waited on, so any number of dispatchers
-// can claim side by side. Deliveries to paused or disabled endpoints stay
-// pending.
+// can claim side by side. Deliveries to paused or disabled endpoints, and to
+// endpoints whose circuit breaker is open, stay pending.
 func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Job, error) {
+	return s.claim(ctx, limit, lease,
+		`d.endpoint_id IN (SELECT id FROM endpoints WHERE status = 'active' AND circuit_open_until IS NULL)`)
+}
+
+// ClaimProbes picks up to limit endpoints whose circuit breaker cool-down has
+// passed and leases one due delivery for each, as a probe. Each picked
+// endpoint's circuit stays open for another lease, so exactly one probe is in
+// flight per endpoint; completing the probe closes the circuit or re-opens
+// it for a longer cool-down.
+func (s *Store) ClaimProbes(ctx context.Context, limit int, lease time.Duration) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		UPDATE endpoints SET circuit_open_until = now() + $2::bigint * interval '1 millisecond'
+		WHERE id IN (
+			SELECT e.id FROM endpoints e
+			WHERE e.status = 'active' AND e.circuit_open_until <= now()
+			  AND EXISTS (SELECT 1 FROM deliveries d
+			              WHERE d.endpoint_id = e.id AND d.state = 'pending' AND d.next_attempt_at <= now())
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED)
+		RETURNING id`, limit, lease.Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+	var endpointIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		endpointIDs = append(endpointIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var jobs []Job
+	for _, id := range endpointIDs {
+		js, err := s.claim(ctx, 1, lease, `d.endpoint_id = $3`, id)
+		if err != nil {
+			return jobs, err
+		}
+		for i := range js {
+			js[i].Probe = true
+		}
+		jobs = append(jobs, js...)
+	}
+	return jobs, nil
+}
+
+// claim leases up to limit due deliveries matching filter, a SQL condition
+// on d (deliveries) whose own parameters start at $3.
+func (s *Store) claim(ctx context.Context, limit int, lease time.Duration, filter string, args ...any) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		WITH claimed AS (
 			UPDATE deliveries
 			SET state = 'in_flight', locked_until = now() + $2::bigint * interval '1 millisecond', updated_at = now()
 			WHERE id = ANY (ARRAY(
 				SELECT d.id FROM deliveries d
-				WHERE d.state = 'pending' AND d.next_attempt_at <= now()
-				  AND d.endpoint_id IN (SELECT id FROM endpoints WHERE status = 'active')
+				WHERE d.state = 'pending' AND d.next_attempt_at <= now() AND `+filter+`
 				ORDER BY d.next_attempt_at
 				LIMIT $1
 				FOR UPDATE SKIP LOCKED))
 			RETURNING id, message_id, endpoint_id, attempt_count, next_attempt_at, locked_until
 		)
 		SELECT c.id, c.message_id, c.endpoint_id, c.attempt_count, c.next_attempt_at, c.locked_until,
-		       m.event_type, m.payload::text, e.url, e.secret
+		       m.event_type, m.payload::text, e.url, e.secret,
+		       CASE WHEN e.previous_secret_expires_at > now() THEN e.previous_secret ELSE '' END
 		FROM claimed c
 		JOIN messages m ON m.id = c.message_id
 		JOIN endpoints e ON e.id = c.endpoint_id`,
-		limit, lease.Milliseconds())
+		append([]any{limit, lease.Milliseconds()}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +119,7 @@ func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Jo
 			payload string
 		)
 		if err := rows.Scan(&j.DeliveryID, &j.MessageID, &j.EndpointID, &j.AttemptCount, &j.DueAt,
-			&j.LockedUntil, &j.EventType, &payload, &j.URL, &j.Secret); err != nil {
+			&j.LockedUntil, &j.EventType, &payload, &j.URL, &j.Secret, &j.PreviousSecret); err != nil {
 			return nil, err
 		}
 		j.Payload = []byte(payload)
@@ -75,15 +137,40 @@ type Outcome struct {
 	RetryAt time.Time
 }
 
-// Complete records an attempt and moves the delivery to its next state, in
-// one transaction. The attempt is always recorded, because the HTTP call
-// happened. The state change applies only if the row still holds j's lease:
-// if the lease expired and another dispatcher took the row over, that
-// dispatcher now owns its state. It reports whether the state changed.
-func (s *Store) Complete(ctx context.Context, j Job, o Outcome) (bool, error) {
+// HealthPolicy decides when an endpoint's circuit breaker trips and when a
+// failing endpoint is disabled.
+type HealthPolicy struct {
+	// FailureThreshold is how many failures in a row trip the breaker.
+	FailureThreshold int
+	// CooldownBase is the first cool-down after tripping; each failed probe
+	// doubles it, up to CooldownMax.
+	CooldownBase, CooldownMax time.Duration
+	// DisableAfter is how long an endpoint may fail continuously before it
+	// is disabled.
+	DisableAfter time.Duration
+}
+
+// CompleteResult reports what Complete changed.
+type CompleteResult struct {
+	// Applied is false when the lease was lost: the attempt was logged but
+	// another dispatcher owns the delivery's state.
+	Applied bool
+	// Tripped is true when this failure opened the endpoint's circuit.
+	Tripped bool
+	// Disabled is true when this failure disabled the endpoint.
+	Disabled bool
+}
+
+// Complete records an attempt, moves the delivery to its next state and
+// updates the endpoint's health, in one transaction. The attempt and the
+// health update always apply, because the HTTP call happened. The delivery's
+// state changes only if the row still holds j's lease: if the lease expired
+// and another dispatcher took the row over, that dispatcher owns its state.
+func (s *Store) Complete(ctx context.Context, j Job, o Outcome, h HealthPolicy) (CompleteResult, error) {
+	var r CompleteResult
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return r, err
 	}
 	defer tx.Rollback()
 
@@ -92,7 +179,7 @@ func (s *Store) Complete(ctx context.Context, j Job, o Outcome) (bool, error) {
 		INSERT INTO attempts (delivery_id, attempted_at, status_code, latency_ms, error, response_body)
 		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''))`,
 		j.DeliveryID, a.AttemptedAt, a.StatusCode, a.LatencyMS, a.Error, a.ResponseBody); err != nil {
-		return false, err
+		return r, err
 	}
 
 	res, err := tx.ExecContext(ctx, `
@@ -105,10 +192,48 @@ func (s *Store) Complete(ctx context.Context, j Job, o Outcome) (bool, error) {
 		WHERE id = $1 AND state = 'in_flight' AND locked_until = $2`,
 		j.DeliveryID, j.LockedUntil, o.NextState, o.RetryAt)
 	if err != nil {
-		return false, err
+		return r, err
 	}
 	n, _ := res.RowsAffected()
-	return n == 1, tx.Commit()
+	r.Applied = n == 1
+
+	if o.NextState == DeliverySucceeded {
+		// Only write when there is something to reset, so successes to a
+		// healthy endpoint do not all queue on its row lock.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE endpoints SET consecutive_failures = 0, failing_since = NULL,
+			                     circuit_open_until = NULL, updated_at = now()
+			WHERE id = $1 AND (consecutive_failures > 0 OR circuit_open_until IS NOT NULL)`,
+			j.EndpointID); err != nil {
+			return r, err
+		}
+	} else {
+		// Columns on the right-hand side are the values before this update.
+		err := tx.QueryRowContext(ctx, `
+			UPDATE endpoints SET
+				consecutive_failures = consecutive_failures + 1,
+				failing_since = coalesce(failing_since, now()),
+				circuit_open_until = CASE
+					WHEN consecutive_failures + 1 >= $2 THEN now() + least(
+						$3::bigint * power(2, least(consecutive_failures + 1 - $2, 20)),
+						$4::bigint) * interval '1 millisecond'
+					ELSE circuit_open_until END,
+				status = CASE
+					WHEN status = 'active' AND failing_since <= now() - $5::bigint * interval '1 millisecond'
+					THEN 'disabled' ELSE status END,
+				disabled_at = CASE
+					WHEN status = 'active' AND failing_since <= now() - $5::bigint * interval '1 millisecond'
+					THEN now() ELSE disabled_at END,
+				updated_at = now()
+			WHERE id = $1
+			RETURNING consecutive_failures = $2, disabled_at IS NOT NULL AND disabled_at = now()`,
+			j.EndpointID, h.FailureThreshold, h.CooldownBase.Milliseconds(),
+			h.CooldownMax.Milliseconds(), h.DisableAfter.Milliseconds()).Scan(&r.Tripped, &r.Disabled)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) { // no rows: endpoint deleted meanwhile
+			return r, err
+		}
+	}
+	return r, tx.Commit()
 }
 
 // ReleaseExpired returns in_flight deliveries whose lease has passed to

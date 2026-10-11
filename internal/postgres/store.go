@@ -16,6 +16,10 @@ import (
 // another application).
 var ErrNotFound = errors.New("not found")
 
+// ErrConflict is returned when a row is not in a state the operation allows,
+// such as replaying a delivery that is still pending.
+var ErrConflict = errors.New("conflict")
+
 // Endpoint statuses.
 const (
 	EndpointActive   = "active"
@@ -45,11 +49,16 @@ type Endpoint struct {
 	URL   string `json:"url"`
 	// Secret is only filled in where the caller needs it (on create, and for
 	// the dispatcher); the API leaves it empty otherwise.
-	Secret     string    `json:"secret,omitempty"`
-	EventTypes []string  `json:"event_types"`
-	Status     string    `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Secret     string   `json:"secret,omitempty"`
+	EventTypes []string `json:"event_types"`
+	Status     string   `json:"status"`
+	// Health, maintained by the dispatcher.
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	FailingSince        *time.Time `json:"failing_since"`
+	CircuitOpenUntil    *time.Time `json:"circuit_open_until"`
+	DisabledAt          *time.Time `json:"disabled_at"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
 }
 
 // Message is one event sent by the operator.
@@ -117,12 +126,15 @@ func (s *Store) GetApp(ctx context.Context, appID string) (App, error) {
 
 // --- endpoints ---
 
-const endpointColumns = `id, app_id, url, secret, event_types, status, created_at, updated_at`
+const endpointColumns = `id, app_id, url, secret, event_types, status,
+	consecutive_failures, failing_since, circuit_open_until, disabled_at, created_at, updated_at`
 
 func scanEndpoint(row interface{ Scan(...any) error }) (Endpoint, error) {
 	var e Endpoint
 	err := row.Scan(&e.ID, &e.AppID, &e.URL, &e.Secret,
-		pgtype.NewMap().SQLScanner(&e.EventTypes), &e.Status, &e.CreatedAt, &e.UpdatedAt)
+		pgtype.NewMap().SQLScanner(&e.EventTypes), &e.Status,
+		&e.ConsecutiveFailures, &e.FailingSince, &e.CircuitOpenUntil, &e.DisabledAt,
+		&e.CreatedAt, &e.UpdatedAt)
 	return e, err
 }
 
@@ -176,17 +188,40 @@ type EndpointPatch struct {
 	Status     *string
 }
 
-// UpdateEndpoint applies a patch and returns the updated endpoint.
+// UpdateEndpoint applies a patch and returns the updated endpoint. Setting
+// the status to active also clears the endpoint's failure history, so a
+// disabled or tripped endpoint starts again with a closed circuit.
 func (s *Store) UpdateEndpoint(ctx context.Context, appID, endpointID string, p EndpointPatch) (Endpoint, error) {
 	row := s.db.QueryRowContext(ctx, `
 		UPDATE endpoints SET
 			url         = COALESCE($3, url),
 			event_types = COALESCE($4, event_types),
 			status      = COALESCE($5, status),
+			consecutive_failures = CASE WHEN $5 = 'active' THEN 0 ELSE consecutive_failures END,
+			failing_since        = CASE WHEN $5 = 'active' THEN NULL ELSE failing_since END,
+			circuit_open_until   = CASE WHEN $5 = 'active' THEN NULL ELSE circuit_open_until END,
+			disabled_at          = CASE WHEN $5 = 'active' THEN NULL ELSE disabled_at END,
 			updated_at  = now()
 		WHERE app_id = $1 AND id = $2
 		RETURNING `+endpointColumns,
 		appID, endpointID, p.URL, p.EventTypes, p.Status)
+	e, err := scanEndpoint(row)
+	return e, notFound(err)
+}
+
+// RotateSecret makes newSecret the endpoint's signing secret. The old secret
+// stays valid for overlap: requests are signed with both until then, so
+// receivers can switch over without dropping any.
+func (s *Store) RotateSecret(ctx context.Context, appID, endpointID, newSecret string, overlap time.Duration) (Endpoint, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE endpoints SET
+			previous_secret            = secret,
+			previous_secret_expires_at = now() + $4::bigint * interval '1 millisecond',
+			secret                     = $3,
+			updated_at                 = now()
+		WHERE app_id = $1 AND id = $2
+		RETURNING `+endpointColumns,
+		appID, endpointID, newSecret, overlap.Milliseconds())
 	e, err := scanEndpoint(row)
 	return e, notFound(err)
 }
@@ -286,6 +321,61 @@ func (s *Store) existingMessage(ctx context.Context, tx *sql.Tx, appID, key stri
 	return r, err
 }
 
+// --- replay ---
+
+const deliveryColumns = `d.id, d.message_id, d.endpoint_id, d.state, d.attempt_count, d.next_attempt_at, d.created_at, d.updated_at`
+
+func scanDelivery(row interface{ Scan(...any) error }) (Delivery, error) {
+	var d Delivery
+	err := row.Scan(&d.ID, &d.MessageID, &d.EndpointID, &d.State, &d.AttemptCount,
+		&d.NextAttemptAt, &d.CreatedAt, &d.UpdatedAt)
+	return d, err
+}
+
+// ReplayDelivery sends a dead or succeeded delivery again, with a fresh
+// retry schedule. The message id, and so the webhook-id header, is unchanged.
+// It returns ErrConflict if the delivery is still pending or in flight.
+func (s *Store) ReplayDelivery(ctx context.Context, appID, deliveryID string) (Delivery, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE deliveries d SET
+			state = 'pending', attempt_count = 0, next_attempt_at = now(), updated_at = now()
+		FROM messages m
+		WHERE d.id = $2 AND m.id = d.message_id AND m.app_id = $1
+		  AND d.state IN ('dead', 'succeeded')
+		RETURNING `+deliveryColumns, appID, deliveryID)
+	d, err := scanDelivery(row)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return d, err
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM deliveries d JOIN messages m ON m.id = d.message_id
+		               WHERE m.app_id = $1 AND d.id = $2)`, appID, deliveryID).Scan(&exists); err != nil {
+		return Delivery{}, err
+	}
+	if exists {
+		return Delivery{}, ErrConflict
+	}
+	return Delivery{}, ErrNotFound
+}
+
+// ReplayEndpoint sends again every dead delivery to an endpoint whose
+// message was created at or after since. It returns how many it queued.
+func (s *Store) ReplayEndpoint(ctx context.Context, appID, endpointID string, since time.Time) (int, error) {
+	if _, err := s.GetEndpoint(ctx, appID, endpointID); err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE deliveries SET
+			state = 'pending', attempt_count = 0, next_attempt_at = now(), updated_at = now()
+		WHERE endpoint_id = $1 AND state = 'dead' AND created_at >= $2`, endpointID, since)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // --- delivery log ---
 
 // ListDeliveries returns every delivery of one message.
@@ -301,17 +391,16 @@ func (s *Store) ListDeliveries(ctx context.Context, appID, messageID string) ([]
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, message_id, endpoint_id, state, attempt_count, next_attempt_at, created_at, updated_at
-		FROM deliveries WHERE message_id = $1 ORDER BY created_at, id`, messageID)
+		SELECT `+deliveryColumns+` FROM deliveries d
+		WHERE d.message_id = $1 ORDER BY d.created_at, d.id`, messageID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []Delivery{}
 	for rows.Next() {
-		var d Delivery
-		if err := rows.Scan(&d.ID, &d.MessageID, &d.EndpointID, &d.State, &d.AttemptCount,
-			&d.NextAttemptAt, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		d, err := scanDelivery(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, d)

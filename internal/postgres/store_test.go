@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+var testPolicy = HealthPolicy{
+	FailureThreshold: 3,
+	CooldownBase:     time.Minute,
+	CooldownMax:      time.Hour,
+	DisableAfter:     5 * 24 * time.Hour,
+}
+
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	db := testDB(t)
@@ -204,12 +211,12 @@ func TestClaimLeasesDueDeliveriesOnce(t *testing.T) {
 	}
 
 	// Retry later: not due yet, so not claimable.
-	changed, err := s.Complete(ctx, j, Outcome{
+	res, err := s.Complete(ctx, j, Outcome{
 		Attempt:   Attempt{AttemptedAt: time.Now(), LatencyMS: 5, Error: "boom"},
 		NextState: DeliveryPending, RetryAt: time.Now().Add(time.Hour),
-	})
-	if err != nil || !changed {
-		t.Fatalf("Complete = %v, %v", changed, err)
+	}, testPolicy)
+	if err != nil || !res.Applied {
+		t.Fatalf("Complete = %+v, %v", res, err)
 	}
 	if again, _ := s.Claim(ctx, 10, time.Minute); len(again) != 0 {
 		t.Fatal("claimed a delivery that is not due")
@@ -262,22 +269,22 @@ func TestExpiredLeaseIsReleasedAndStaleCompletionIgnored(t *testing.T) {
 
 	// The first dispatcher finishes late: its attempt is logged, but the row
 	// belongs to the second claim now.
-	changed, err := s.Complete(ctx, stale[0], Outcome{
+	res, err := s.Complete(ctx, stale[0], Outcome{
 		Attempt: Attempt{AttemptedAt: time.Now(), LatencyMS: 1}, NextState: DeliverySucceeded,
-	})
-	if err != nil || changed {
-		t.Fatalf("stale Complete = %v, %v; want no state change", changed, err)
+	}, testPolicy)
+	if err != nil || res.Applied {
+		t.Fatalf("stale Complete = %+v, %v; want no state change", res, err)
 	}
 	ds, _ := s.ListDeliveries(ctx, app.ID, r.Message.ID)
 	if ds[0].State != DeliveryInFlight {
 		t.Fatalf("state = %s, want in_flight", ds[0].State)
 	}
 
-	changed, err = s.Complete(ctx, fresh[0], Outcome{
+	res, err = s.Complete(ctx, fresh[0], Outcome{
 		Attempt: Attempt{AttemptedAt: time.Now(), LatencyMS: 1}, NextState: DeliverySucceeded,
-	})
-	if err != nil || !changed {
-		t.Fatalf("fresh Complete = %v, %v", changed, err)
+	}, testPolicy)
+	if err != nil || !res.Applied {
+		t.Fatalf("fresh Complete = %+v, %v", res, err)
 	}
 	as, _ := s.ListAttempts(ctx, app.ID, fresh[0].DeliveryID)
 	if len(as) != 2 {
