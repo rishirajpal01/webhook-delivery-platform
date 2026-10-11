@@ -48,7 +48,19 @@ var (
 		Name: "webhookd_deliveries_in_flight",
 		Help: "Deliveries this process is sending right now.",
 	})
+	circuitTrips = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "webhookd_endpoint_circuit_trips_total",
+		Help: "Times an endpoint's circuit breaker opened after repeated failures.",
+	})
+	endpointsDisabled = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "webhookd_endpoints_disabled_total",
+		Help: "Endpoints disabled after failing continuously.",
+	})
 )
+
+// maxRetryAfter caps how long a receiver's Retry-After header can push a
+// retry back.
+const maxRetryAfter = 24 * time.Hour
 
 // Config tunes a dispatcher. Zero values take the defaults noted.
 type Config struct {
@@ -59,6 +71,10 @@ type Config struct {
 	Schedule       []time.Duration // retry delays; default DefaultSchedule
 	// AllowPrivateNetworks turns off the SSRF guard. Local development only.
 	AllowPrivateNetworks bool
+	// Health decides when an endpoint's circuit breaker trips and when it is
+	// disabled. Defaults: trip after 10 failures in a row, cool down for 1m
+	// doubling to 1h between probes, disable after 5 days of failure.
+	Health postgres.HealthPolicy
 }
 
 func (c *Config) setDefaults() {
@@ -76,6 +92,18 @@ func (c *Config) setDefaults() {
 	}
 	if c.Schedule == nil {
 		c.Schedule = DefaultSchedule
+	}
+	if c.Health.FailureThreshold <= 0 {
+		c.Health.FailureThreshold = 10
+	}
+	if c.Health.CooldownBase <= 0 {
+		c.Health.CooldownBase = time.Minute
+	}
+	if c.Health.CooldownMax <= 0 {
+		c.Health.CooldownMax = time.Hour
+	}
+	if c.Health.DisableAfter <= 0 {
+		c.Health.DisableAfter = 5 * 24 * time.Hour
 	}
 }
 
@@ -154,7 +182,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			continue
 		}
 
-		jobs, err := d.store.Claim(ctx, free, d.cfg.Lease)
+		jobs, err := d.claim(ctx, free)
 		if err != nil {
 			if ctx.Err() == nil {
 				d.logger.Error("claim failed", "err", err)
@@ -181,7 +209,25 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			sleep(ctx, d.cfg.PollInterval)
 		}
 	}
+	d.logger.Info("dispatcher draining", "in_flight", len(sem))
 	return nil
+}
+
+// claim fills up to free slots: probes for endpoints whose circuit breaker
+// is ready for one first, then ordinary due deliveries.
+func (d *Dispatcher) claim(ctx context.Context, free int) ([]postgres.Job, error) {
+	jobs, err := d.store.ClaimProbes(ctx, free, d.cfg.Lease)
+	if err != nil {
+		return jobs, err
+	}
+	if rest := free - len(jobs); rest > 0 {
+		more, err := d.store.Claim(ctx, rest, d.cfg.Lease)
+		jobs = append(jobs, more...)
+		if err != nil {
+			return jobs, err
+		}
+	}
+	return jobs, nil
 }
 
 func (d *Dispatcher) releaseExpiredLoop(ctx context.Context) {
@@ -210,7 +256,7 @@ func (d *Dispatcher) process(ctx context.Context, j postgres.Job) {
 	inFlight.Inc()
 	defer inFlight.Dec()
 
-	attempt := d.send(ctx, j)
+	attempt, retryAfter := d.send(ctx, j)
 	ok := attempt.StatusCode != nil && *attempt.StatusCode >= 200 && *attempt.StatusCode < 300
 
 	o := postgres.Outcome{Attempt: attempt}
@@ -218,6 +264,8 @@ func (d *Dispatcher) process(ctx context.Context, j postgres.Job) {
 	case ok:
 		o.NextState = postgres.DeliverySucceeded
 	case retry:
+		// Never come back sooner than the receiver asked.
+		delay = max(delay, min(retryAfter, maxRetryAfter))
 		o.NextState = postgres.DeliveryPending
 		o.RetryAt = time.Now().Add(delay)
 	default:
@@ -232,37 +280,56 @@ func (d *Dispatcher) process(ctx context.Context, j postgres.Job) {
 	attemptsTotal.WithLabelValues(outcome).Inc()
 
 	log := d.logger.With("delivery_id", j.DeliveryID, "message_id", j.MessageID,
-		"endpoint_id", j.EndpointID, "attempt", j.AttemptCount+1, "outcome", outcome)
+		"endpoint_id", j.EndpointID, "attempt", j.AttemptCount+1, "outcome", outcome, "probe", j.Probe)
 	if !ok {
 		log.Info("delivery attempt failed", "status", attempt.StatusCode, "err", attempt.Error)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	changed, err := d.store.Complete(ctx, j, o)
-	switch {
-	case err != nil:
+	r, err := d.store.Complete(ctx, j, o, d.cfg.Health)
+	if err != nil {
 		// The lease will expire and the delivery will be sent again.
 		log.Error("recording attempt failed", "err", err)
-	case !changed:
+		return
+	}
+	if !r.Applied {
 		log.Warn("lease was lost before the attempt was recorded; another dispatcher owns the delivery")
+	}
+	if r.Tripped {
+		circuitTrips.Inc()
+		log.Warn("endpoint circuit breaker opened", "consecutive_failures", d.cfg.Health.FailureThreshold)
+	}
+	if r.Disabled {
+		endpointsDisabled.Inc()
+		log.Warn("endpoint disabled after failing continuously", "after", d.cfg.Health.DisableAfter.String())
 	}
 }
 
-// send makes one signed HTTP request and describes what happened.
-func (d *Dispatcher) send(ctx context.Context, j postgres.Job) postgres.Attempt {
+// send makes one signed HTTP request and describes what happened. It also
+// returns how long a 429 or 503 response asked us to wait (0 if it did not).
+func (d *Dispatcher) send(ctx context.Context, j postgres.Job) (postgres.Attempt, time.Duration) {
 	start := time.Now()
 	a := postgres.Attempt{DeliveryID: j.DeliveryID, AttemptedAt: start}
-	fail := func(err error) postgres.Attempt {
+	fail := func(err error) (postgres.Attempt, time.Duration) {
 		a.LatencyMS = int(time.Since(start).Milliseconds())
 		a.Error = err.Error()
 		attemptDuration.Observe(time.Since(start).Seconds())
-		return a
+		return a, 0
 	}
 
 	sig, err := signing.Sign(j.Secret, j.MessageID, start, j.Payload)
 	if err != nil {
 		return fail(err)
+	}
+	if j.PreviousSecret != "" {
+		// During rotation, sign with the old secret too; receivers accept a
+		// request if any signature matches.
+		old, err := signing.Sign(j.PreviousSecret, j.MessageID, start, j.Payload)
+		if err != nil {
+			return fail(err)
+		}
+		sig += " " + old
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, j.URL, bytes.NewReader(j.Payload))
 	if err != nil {
@@ -289,7 +356,30 @@ func (d *Dispatcher) send(ctx context.Context, j postgres.Job) postgres.Attempt 
 	a.StatusCode = &code
 	// Postgres text cannot hold invalid UTF-8 or NUL bytes.
 	a.ResponseBody = strings.ReplaceAll(string(bytes.ToValidUTF8(body, []byte("\uFFFD"))), "\x00", "")
-	return a
+
+	var retryAfter time.Duration
+	if code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable {
+		retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+	}
+	return a, retryAfter
+}
+
+// parseRetryAfter reads a Retry-After header, which is either a number of
+// seconds or an HTTP date. It returns 0 for anything else.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil && t.After(now) {
+		return t.Sub(now)
+	}
+	return 0
 }
 
 func sleep(ctx context.Context, d time.Duration) {
