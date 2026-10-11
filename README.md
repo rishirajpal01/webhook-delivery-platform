@@ -7,9 +7,10 @@ and recording every attempt.
 
 One Go binary plus Postgres. No Kafka, Redis or Kubernetes required.
 
-> **Status: phase 1 (core delivery, MVP).** Sending, fan-out, retries,
-> signing, the attempt log and the SSRF guard work. Replay, circuit breaking
-> and per-endpoint fairness come in phases 2 and 3.
+> **Status: phase 2 (reliability).** Sending, fan-out, retries, signing, the
+> attempt log and the SSRF guard work, plus replay, a per-endpoint circuit
+> breaker, auto-disable, `Retry-After`, secret rotation and graceful drain.
+> Per-endpoint fairness comes in phase 3.
 
 ## Guarantees
 
@@ -52,10 +53,13 @@ All `/v1` routes need `Authorization: Bearer $API_KEY`. Errors are
 | `GET /v1/apps/{app}` | Read an application |
 | `POST /v1/apps/{app}/endpoints` | Create an endpoint `{"url", "event_types"?, "secret"?}`; returns the signing secret once |
 | `GET /v1/apps/{app}/endpoints?limit=&cursor=` | List endpoints |
-| `GET`, `PATCH`, `DELETE /v1/apps/{app}/endpoints/{ep}` | Read, change (`url`, `event_types`, `status`: active or paused) or delete an endpoint |
+| `GET`, `PATCH`, `DELETE /v1/apps/{app}/endpoints/{ep}` | Read, change (`url`, `event_types`, `status`: active or paused) or delete an endpoint. Setting `active` also re-enables a disabled endpoint and clears its failure history |
+| `POST /v1/apps/{app}/endpoints/{ep}/secret/rotate` | New signing secret `{"secret"?}`, returned once; the old one keeps signing for 24 h |
+| `POST /v1/apps/{app}/endpoints/{ep}/replay` | Redeliver every `dead` delivery created since `{"since": "<RFC 3339>"}`; returns `{"replayed": n}` |
 | `POST /v1/apps/{app}/messages` | Send an event `{"event_type", "payload"}`; honours `Idempotency-Key` |
 | `GET /v1/apps/{app}/messages/{msg}/deliveries` | Where a message went and the state of each delivery |
 | `GET /v1/apps/{app}/deliveries/{del}/attempts` | Every attempt: status, latency, error, first 4 KB of the response |
+| `POST /v1/apps/{app}/deliveries/{del}/replay` | Send a `dead` or `succeeded` delivery again (409 while it is still pending) |
 | `GET /healthz`, `/readyz`, `/metrics` | Liveness, readiness (Postgres reachable), Prometheus metrics |
 
 ```sh
@@ -80,6 +84,22 @@ An endpoint with no `event_types` receives every event type.
 - **Signing:** `webhook-id`, `webhook-timestamp` and
   `webhook-signature: v1,<base64 HMAC-SHA256 of id.timestamp.body>`, so any
   Standard Webhooks library can verify requests.
+- **`Retry-After`:** on a 429 or 503 the next attempt waits at least as long
+  as the receiver asked (seconds or an HTTP date, capped at 24 h).
+- **Circuit breaker:** after 10 failures in a row an endpoint's deliveries
+  stop being sent. After 1 minute one probe delivery is tried; if it fails
+  the wait doubles (up to 1 h), if it succeeds everything queued flows
+  again. Other endpoints are unaffected.
+- **Auto-disable:** an endpoint that has failed continuously for 5 days is
+  set to `disabled` (`disabled_at` shows when). Its deliveries wait; set
+  `status` back to `active` to resume them.
+- **Replay:** sends a delivery again with the same `webhook-id`, so receivers
+  that already processed it can still drop it. It starts a fresh retry
+  schedule.
+- **Secret rotation:** for 24 h after a rotation each request carries two
+  signatures, one per secret, so receivers can switch at their own pace.
+- **Graceful drain:** on SIGTERM a dispatcher stops claiming, finishes the
+  sends it started and records them before exiting.
 
 ## Configuration
 
@@ -105,6 +125,8 @@ Any number of `api` and `dispatcher` processes can run against one Postgres.
 | `webhookd_delivery_attempt_duration_seconds` | Request duration |
 | `webhookd_delivery_lag_seconds` | Time from a delivery becoming due to being claimed |
 | `webhookd_deliveries_in_flight` | Sends in progress in this process |
+| `webhookd_endpoint_circuit_trips_total` | Times an endpoint's circuit breaker opened |
+| `webhookd_endpoints_disabled_total` | Endpoints disabled after failing continuously |
 
 ## Develop
 
@@ -127,7 +149,7 @@ CRASH_TEST_MESSAGES=100000 CRASH_TEST_KILLS=8 go test -run Crash -timeout 10m ./
 cmd/webhookd         the service (api and dispatcher roles)
 cmd/mockreceiver     a receiver for demos and tests (-fail-rate, -latency, -secret)
 internal/api         HTTP routes, auth, validation
-internal/dispatcher  claim, send, retry
+internal/dispatcher  claim, send, retry, circuit breaker
 internal/postgres    connection, migrations, queries
 internal/signing     Standard Webhooks sign and verify
 internal/ssrf        dialer that refuses non-public addresses
@@ -141,7 +163,7 @@ scripts/demo.sh      end-to-end walkthrough (also run in CI)
 | ----- | ----- |
 | 0 · Foundations ✓ | Layout, CI, compose, migrations, mock receiver |
 | 1 · Core delivery ✓ | Apps, endpoints, send with idempotency, fan-out, dispatcher with leases, retries, signing, attempt log, SSRF guard, metrics |
-| 2 · Reliability | Replay, circuit breaker and auto-disable, `Retry-After`, secret rotation, graceful drain |
+| 2 · Reliability ✓ | Replay, circuit breaker and auto-disable, `Retry-After`, secret rotation, graceful drain |
 | 3 · Fairness and scale | Per-endpoint concurrency and rate limits, multiple dispatchers, partitioned attempts, load generator |
 | 4 · Developer experience | OpenAPI spec, Go SDK, `Verify()` helper, CLI |
 | 5 · Launch | Benchmarks in this README, write-up, v1.0 |
