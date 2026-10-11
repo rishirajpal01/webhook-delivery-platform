@@ -1,7 +1,8 @@
 // Command webhookd runs the webhook delivery service.
 //
-// Phase 0 only connects to Postgres, applies migrations and serves health
-// checks. Delivery arrives in phase 1.
+// ROLE picks what the process does: "api" serves the HTTP API, "dispatcher"
+// sends deliveries, and "all" (the default) does both. Any number of each can
+// run against one Postgres.
 package main
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	"github.com/rishirajpal01/webhook-delivery-platform/internal/api"
 	"github.com/rishirajpal01/webhook-delivery-platform/internal/config"
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/dispatcher"
 	"github.com/rishirajpal01/webhook-delivery-platform/internal/postgres"
 )
 
@@ -46,31 +48,60 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("migrations up to date", "applied", applied)
+	logger.Info("migrations up to date", "applied", applied, "role", cfg.Role)
 
-	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           api.NewHandler(db, logger),
-		ReadHeaderTimeout: 5 * time.Second,
+	store := postgres.NewStore(db)
+	errc := make(chan error, 2)
+	running := 0
+
+	// Every role serves health checks and metrics; only the api role serves /v1.
+	handler := api.NewOpsHandler(db, logger)
+	if cfg.RunsAPI() {
+		handler = api.NewHandler(db, store, cfg.APIKey, logger)
 	}
-
-	errc := make(chan error, 1)
+	srv := &http.Server{Addr: cfg.ListenAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	running++
 	go func() {
-		logger.Info("api listening", "addr", cfg.ListenAddr)
-		errc <- srv.ListenAndServe()
+		logger.Info("http listening", "addr", cfg.ListenAddr)
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			errc <- err
+			return
+		}
+		errc <- nil
 	}()
 
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
+	if cfg.RunsDispatcher() {
+		d := dispatcher.New(store, dispatcher.Config{
+			Concurrency:          cfg.DispatcherConcurrency,
+			Lease:                cfg.DispatcherLease,
+			AllowPrivateNetworks: cfg.AllowPrivateNetworks,
+		}, logger)
+		if cfg.AllowPrivateNetworks {
+			logger.Warn("SSRF guard is off: deliveries may reach private networks")
+		}
+		running++
+		go func() { errc <- d.Run(ctx) }()
 	}
+
+	// Run until a signal arrives or a component fails.
+	var firstErr error
+	select {
+	case <-ctx.Done():
+	case firstErr = <-errc:
+		running--
+	}
+	stop() // a failure stops the other component too
 
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	if err := srv.Shutdown(shutdownCtx); err != nil && firstErr == nil {
+		firstErr = err
 	}
-	return nil
+	for ; running > 0; running-- {
+		if err := <-errc; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

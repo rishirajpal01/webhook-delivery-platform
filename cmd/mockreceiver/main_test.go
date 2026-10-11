@@ -5,9 +5,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/signing"
 )
 
 func TestHandler(t *testing.T) {
@@ -44,5 +47,34 @@ func TestHandlerLatency(t *testing.T) {
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/", nil))
 	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
 		t.Errorf("responded after %v, want at least 50ms", elapsed)
+	}
+}
+
+func TestHandlerVerifiesSignatures(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	secret := signing.NewSecret()
+	h := newHandler(options{secret: secret}, func() float64 { return 1 }, logger)
+
+	body := `{"a":1}`
+	now := time.Now()
+	sig, _ := signing.Sign(secret, "msg_1", now, []byte(body))
+	for name, tc := range map[string]struct {
+		sig  string
+		want int
+	}{
+		"valid":  {sig, http.StatusOK},
+		"forged": {"v1,AAAA", http.StatusUnauthorized},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/", strings.NewReader(body))
+			req.Header.Set(signing.HeaderID, "msg_1")
+			req.Header.Set(signing.HeaderTimestamp, strconv.FormatInt(now.Unix(), 10))
+			req.Header.Set(signing.HeaderSignature, tc.sig)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d", rec.Code, tc.want)
+			}
+		})
 	}
 }

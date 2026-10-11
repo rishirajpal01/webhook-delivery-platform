@@ -2,20 +2,28 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/postgres"
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/testdb"
 )
+
+const testKey = "test-key"
+
+var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 type fakePinger struct{ err error }
 
 func (f fakePinger) PingContext(context.Context) error { return f.err }
 
-func TestRoutes(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+func TestHealthRoutes(t *testing.T) {
 	tests := []struct {
 		name   string
 		method string
@@ -27,12 +35,14 @@ func TestRoutes(t *testing.T) {
 		{"healthz ignores the database", "GET", "/healthz", errors.New("down"), http.StatusOK},
 		{"readyz with database up", "GET", "/readyz", nil, http.StatusOK},
 		{"readyz with database down", "GET", "/readyz", errors.New("down"), http.StatusServiceUnavailable},
+		{"metrics", "GET", "/metrics", nil, http.StatusOK},
 		{"wrong method", "POST", "/healthz", nil, http.StatusMethodNotAllowed},
 		{"unknown path", "GET", "/nope", nil, http.StatusNotFound},
+		{"v1 without key", "GET", "/v1/apps/app_1", nil, http.StatusUnauthorized},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := NewHandler(fakePinger{tt.dbErr}, logger)
+			h := NewHandler(fakePinger{tt.dbErr}, nil, testKey, discard)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(tt.method, tt.path, nil))
 			if rec.Code != tt.want {
@@ -40,4 +50,168 @@ func TestRoutes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// client calls the handler with the API key.
+type client struct {
+	t *testing.T
+	h http.Handler
+}
+
+func newClient(t *testing.T) client {
+	db, _ := testdb.New(t)
+	if _, err := postgres.Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	return client{t: t, h: NewHandler(db, postgres.NewStore(db), testKey, discard)}
+}
+
+// do sends a request and decodes the JSON response into out (if non-nil).
+func (c client) do(method, path, body string, out any, headers ...string) *httptest.ResponseRecorder {
+	c.t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	rec := httptest.NewRecorder()
+	c.h.ServeHTTP(rec, req)
+	if out != nil {
+		if err := json.Unmarshal(rec.Body.Bytes(), out); err != nil {
+			c.t.Fatalf("%s %s: decode %q: %v", method, path, rec.Body.String(), err)
+		}
+	}
+	return rec
+}
+
+func (c client) expect(rec *httptest.ResponseRecorder, want int) {
+	c.t.Helper()
+	if rec.Code != want {
+		c.t.Fatalf("status = %d, want %d; body %s", rec.Code, want, rec.Body.String())
+	}
+}
+
+func TestSendFlow(t *testing.T) {
+	c := newClient(t)
+
+	var app postgres.App
+	c.expect(c.do("POST", "/v1/apps", `{"name":"acme"}`, &app), http.StatusCreated)
+	base := "/v1/apps/" + app.ID
+
+	var ep postgres.Endpoint
+	c.expect(c.do("POST", base+"/endpoints", `{"url":"https://example.com/hook","event_types":["order.paid"]}`, &ep), http.StatusCreated)
+	if !strings.HasPrefix(ep.Secret, "whsec_") {
+		t.Fatalf("create should return a generated secret, got %q", ep.Secret)
+	}
+	var got postgres.Endpoint
+	c.expect(c.do("GET", base+"/endpoints/"+ep.ID, "", &got), http.StatusOK)
+	if got.Secret != "" {
+		t.Fatal("GET must not return the secret")
+	}
+
+	var sent struct {
+		ID         string `json:"id"`
+		Deliveries int    `json:"deliveries"`
+	}
+	msg := `{"event_type":"order.paid","payload":{"order_id":"981"}}`
+	c.expect(c.do("POST", base+"/messages", msg, &sent, "Idempotency-Key", "order-981"), http.StatusAccepted)
+	if sent.Deliveries != 1 {
+		t.Fatalf("deliveries = %d, want 1", sent.Deliveries)
+	}
+
+	var again struct{ ID string }
+	rec := c.do("POST", base+"/messages", msg, &again, "Idempotency-Key", "order-981")
+	c.expect(rec, http.StatusOK)
+	if again.ID != sent.ID || rec.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("repeat send returned %s (replayed=%q), want %s", again.ID, rec.Header().Get("Idempotent-Replayed"), sent.ID)
+	}
+
+	var ds list[postgres.Delivery]
+	c.expect(c.do("GET", base+"/messages/"+sent.ID+"/deliveries", "", &ds), http.StatusOK)
+	if len(ds.Data) != 1 || ds.Data[0].EndpointID != ep.ID || ds.Data[0].State != "pending" {
+		t.Fatalf("deliveries = %+v", ds.Data)
+	}
+	var as list[postgres.Attempt]
+	c.expect(c.do("GET", base+"/deliveries/"+ds.Data[0].ID+"/attempts", "", &as), http.StatusOK)
+	if len(as.Data) != 0 {
+		t.Fatalf("attempts = %+v, want none yet", as.Data)
+	}
+
+	var patched postgres.Endpoint
+	c.expect(c.do("PATCH", base+"/endpoints/"+ep.ID, `{"status":"paused"}`, &patched), http.StatusOK)
+	if patched.Status != "paused" || len(patched.EventTypes) != 1 {
+		t.Fatalf("patched = %+v", patched)
+	}
+
+	var page list[postgres.Endpoint]
+	c.expect(c.do("GET", base+"/endpoints?limit=1", "", &page), http.StatusOK)
+	if len(page.Data) != 1 || page.NextCursor != ep.ID || page.Data[0].Secret != "" {
+		t.Fatalf("page = %+v", page)
+	}
+	var page2 list[postgres.Endpoint]
+	c.expect(c.do("GET", base+"/endpoints?limit=1&cursor="+page.NextCursor, "", &page2), http.StatusOK)
+	if len(page2.Data) != 0 || page2.NextCursor != "" {
+		t.Fatalf("second page = %+v", page2)
+	}
+
+	c.expect(c.do("DELETE", base+"/endpoints/"+ep.ID, "", nil), http.StatusNoContent)
+	c.expect(c.do("GET", base+"/endpoints/"+ep.ID, "", nil), http.StatusNotFound)
+}
+
+func TestValidationAndNotFound(t *testing.T) {
+	c := newClient(t)
+	var app postgres.App
+	c.expect(c.do("POST", "/v1/apps", `{"name":"acme"}`, &app), http.StatusCreated)
+	base := "/v1/apps/" + app.ID
+
+	tests := []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{"unknown field", "POST", "/v1/apps", `{"name":"a","x":1}`, 400},
+		{"bad json", "POST", "/v1/apps", `{`, 400},
+		{"empty name", "POST", "/v1/apps", `{"name":""}`, 422},
+		{"missing app", "GET", "/v1/apps/app_missing", "", 404},
+		{"endpoint for missing app", "POST", "/v1/apps/app_missing/endpoints", `{"url":"https://x.io"}`, 404},
+		{"ftp url", "POST", base + "/endpoints", `{"url":"ftp://x.io"}`, 422},
+		{"relative url", "POST", base + "/endpoints", `{"url":"/hook"}`, 422},
+		{"url with credentials", "POST", base + "/endpoints", `{"url":"https://u:p@x.io"}`, 422},
+		{"bad secret", "POST", base + "/endpoints", `{"url":"https://x.io","secret":"hunter2"}`, 422},
+		{"empty event type", "POST", base + "/endpoints", `{"url":"https://x.io","event_types":[""]}`, 422},
+		{"set disabled", "PATCH", base + "/endpoints/ep_x", `{"status":"disabled"}`, 422},
+		{"patch missing endpoint", "PATCH", base + "/endpoints/ep_x", `{"status":"paused"}`, 404},
+		{"no payload", "POST", base + "/messages", `{"event_type":"a"}`, 422},
+		{"null payload", "POST", base + "/messages", `{"event_type":"a","payload":null}`, 422},
+		{"no event type", "POST", base + "/messages", `{"payload":{}}`, 422},
+		{"send to missing app", "POST", "/v1/apps/app_missing/messages", `{"event_type":"a","payload":{}}`, 404},
+		{"deliveries of missing message", "GET", base + "/messages/msg_x/deliveries", "", 404},
+		{"attempts of missing delivery", "GET", base + "/deliveries/del_x/attempts", "", 404},
+		{"bad limit", "GET", base + "/endpoints?limit=500", "", 400},
+		{"list endpoints of missing app", "GET", "/v1/apps/app_missing/endpoints", "", 404},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := c.do(tt.method, tt.path, tt.body, nil)
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d; body %s", rec.Code, tt.want, rec.Body.String())
+			}
+			if rec.Code >= 400 && rec.Header().Get("Content-Type") != "application/problem+json" {
+				t.Errorf("error content type = %q", rec.Header().Get("Content-Type"))
+			}
+		})
+	}
+
+	// Another app's message is not visible.
+	var other postgres.App
+	c.expect(c.do("POST", "/v1/apps", `{"name":"other"}`, &other), http.StatusCreated)
+	var sent struct{ ID string }
+	c.expect(c.do("POST", "/v1/apps/"+other.ID+"/messages", `{"event_type":"a","payload":{}}`, &sent), http.StatusAccepted)
+	c.expect(c.do("GET", base+"/messages/"+sent.ID+"/deliveries", "", nil), http.StatusNotFound)
+
+	// A wrong key is rejected.
+	req := httptest.NewRequest("GET", base, nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	c.h.ServeHTTP(rec, req)
+	c.expect(rec, http.StatusUnauthorized)
 }

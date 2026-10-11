@@ -1,0 +1,268 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/postgres"
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/signing"
+)
+
+const maxNameLen = 255
+
+var messagesCreated = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "webhookd_messages_created_total",
+	Help: "Messages accepted by the API, not counting idempotent repeats.",
+})
+
+// --- applications ---
+
+func (s *server) createApp(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Name == "" || len(req.Name) > maxNameLen {
+		problem(w, http.StatusUnprocessableEntity, "name is required and must be at most 255 bytes")
+		return
+	}
+	app, err := s.store.CreateApp(r.Context(), req.Name)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, app)
+}
+
+func (s *server) getApp(w http.ResponseWriter, r *http.Request) {
+	app, err := s.store.GetApp(r.Context(), r.PathValue("app"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, app)
+}
+
+// --- endpoints ---
+
+func (s *server) createEndpoint(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL        string   `json:"url"`
+		EventTypes []string `json:"event_types"`
+		Secret     string   `json:"secret"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if msg := validateURL(req.URL); msg != "" {
+		problem(w, http.StatusUnprocessableEntity, msg)
+		return
+	}
+	if msg := validateEventTypes(req.EventTypes); msg != "" {
+		problem(w, http.StatusUnprocessableEntity, msg)
+		return
+	}
+	if req.Secret == "" {
+		req.Secret = signing.NewSecret()
+	} else if !signing.ValidSecret(req.Secret) {
+		problem(w, http.StatusUnprocessableEntity, "secret must be whsec_ followed by base64 of at least 16 bytes")
+		return
+	}
+
+	ep, err := s.store.CreateEndpoint(r.Context(), postgres.Endpoint{
+		AppID: r.PathValue("app"), URL: req.URL, EventTypes: req.EventTypes, Secret: req.Secret,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	// The secret is returned once, here, so the operator can hand it to the
+	// receiver.
+	writeJSON(w, http.StatusCreated, ep)
+}
+
+func (s *server) listEndpoints(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 100 {
+			problem(w, http.StatusBadRequest, "limit must be between 1 and 100")
+			return
+		}
+		limit = n
+	}
+	appID := r.PathValue("app")
+	if _, err := s.store.GetApp(r.Context(), appID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	eps, err := s.store.ListEndpoints(r.Context(), appID, r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	out := list[postgres.Endpoint]{Data: eps}
+	for i := range out.Data {
+		out.Data[i].Secret = ""
+	}
+	if len(eps) == limit {
+		out.NextCursor = eps[len(eps)-1].ID
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *server) getEndpoint(w http.ResponseWriter, r *http.Request) {
+	ep, err := s.store.GetEndpoint(r.Context(), r.PathValue("app"), r.PathValue("ep"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	ep.Secret = ""
+	writeJSON(w, http.StatusOK, ep)
+}
+
+func (s *server) updateEndpoint(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL        *string   `json:"url"`
+		EventTypes *[]string `json:"event_types"`
+		Status     *string   `json:"status"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.URL != nil {
+		if msg := validateURL(*req.URL); msg != "" {
+			problem(w, http.StatusUnprocessableEntity, msg)
+			return
+		}
+	}
+	if req.EventTypes != nil {
+		if msg := validateEventTypes(*req.EventTypes); msg != "" {
+			problem(w, http.StatusUnprocessableEntity, msg)
+			return
+		}
+	}
+	// "disabled" is set by the service when an endpoint keeps failing.
+	if req.Status != nil && *req.Status != postgres.EndpointActive && *req.Status != postgres.EndpointPaused {
+		problem(w, http.StatusUnprocessableEntity, `status must be "active" or "paused"`)
+		return
+	}
+
+	ep, err := s.store.UpdateEndpoint(r.Context(), r.PathValue("app"), r.PathValue("ep"), postgres.EndpointPatch{
+		URL: req.URL, EventTypes: req.EventTypes, Status: req.Status,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	ep.Secret = ""
+	writeJSON(w, http.StatusOK, ep)
+}
+
+func (s *server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteEndpoint(r.Context(), r.PathValue("app"), r.PathValue("ep")); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- messages ---
+
+func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EventType string          `json:"event_type"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.EventType == "" || len(req.EventType) > maxNameLen {
+		problem(w, http.StatusUnprocessableEntity, "event_type is required and must be at most 255 bytes")
+		return
+	}
+	if len(req.Payload) == 0 || bytes.Equal(req.Payload, []byte("null")) {
+		problem(w, http.StatusUnprocessableEntity, "payload is required")
+		return
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if len(key) > maxNameLen {
+		problem(w, http.StatusBadRequest, "Idempotency-Key must be at most 255 bytes")
+		return
+	}
+
+	res, err := s.store.CreateMessage(r.Context(), postgres.Message{
+		AppID: r.PathValue("app"), EventType: req.EventType, Payload: req.Payload, IdempotencyKey: key,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	status := http.StatusAccepted
+	if res.Duplicate {
+		// Same answer as the first send; nothing new was queued.
+		w.Header().Set("Idempotent-Replayed", "true")
+		status = http.StatusOK
+	} else {
+		messagesCreated.Inc()
+	}
+	writeJSON(w, status, map[string]any{"id": res.Message.ID, "deliveries": res.Deliveries})
+}
+
+func (s *server) listDeliveries(w http.ResponseWriter, r *http.Request) {
+	ds, err := s.store.ListDeliveries(r.Context(), r.PathValue("app"), r.PathValue("msg"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list[postgres.Delivery]{Data: ds})
+}
+
+func (s *server) listAttempts(w http.ResponseWriter, r *http.Request) {
+	as, err := s.store.ListAttempts(r.Context(), r.PathValue("app"), r.PathValue("del"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list[postgres.Attempt]{Data: as})
+}
+
+// --- validation ---
+
+// validateURL returns a problem detail, or "" if u is acceptable. Whether
+// the host is public is checked at send time, after DNS resolution.
+func validateURL(u string) string {
+	if len(u) > 2048 {
+		return "url must be at most 2048 bytes"
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return "url must be an absolute http or https URL"
+	}
+	if parsed.User != nil {
+		return "url must not contain credentials"
+	}
+	return ""
+}
+
+func validateEventTypes(types []string) string {
+	if len(types) > 100 {
+		return "event_types may list at most 100 types"
+	}
+	for _, t := range types {
+		if t == "" || len(t) > maxNameLen {
+			return fmt.Sprintf("event type %q must be 1 to 255 bytes", t)
+		}
+	}
+	return ""
+}
