@@ -157,6 +157,47 @@ func TestEndpointDisabledAfterContinuousFailure(t *testing.T) {
 	}
 }
 
+func TestEndpointDisabledEvent(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	app := mustApp(t, s)
+	failing := mustEndpoint(t, s, app.ID, "a")
+	ops := mustEndpoint(t, s, app.ID, EventEndpointDisabled)
+	mustEndpoint(t, s, app.ID) // empty filter: every operator event, but not the service's own
+	mustSend(t, s, app.ID, "a")
+
+	exec(t, s, `UPDATE endpoints SET failing_since = now() - interval '6 days' WHERE id = $1`, failing.ID)
+	var job Job
+	for {
+		jobs, _ := s.Claim(ctx, 1, time.Minute)
+		if len(jobs) == 0 {
+			t.Fatal("the failing endpoint's delivery was never claimed")
+		}
+		if jobs[0].EndpointID == failing.ID {
+			job = jobs[0]
+			break
+		}
+		succeedJob(t, s, jobs[0]) // the wildcard endpoint's copy of "a"
+	}
+	r := failJob(t, s, job)
+	if !r.Disabled || r.DisabledEvent == "" {
+		t.Fatalf("result = %+v; want disabled with an event", r)
+	}
+
+	ds, err := s.ListDeliveries(ctx, app.ID, r.DisabledEvent, "", 100)
+	if err != nil || len(ds) != 1 || ds[0].EndpointID != ops.ID {
+		t.Fatalf("event deliveries = %+v, %v; want one, to the subscribed endpoint", ds, err)
+	}
+	var eventType, payloadEndpoint string
+	if err := s.db.QueryRowContext(ctx, `SELECT event_type, payload->>'endpoint_id' FROM messages WHERE id = $1`,
+		r.DisabledEvent).Scan(&eventType, &payloadEndpoint); err != nil {
+		t.Fatal(err)
+	}
+	if eventType != EventEndpointDisabled || payloadEndpoint != failing.ID {
+		t.Fatalf("event = %s about %s", eventType, payloadEndpoint)
+	}
+}
+
 func TestRotateSecretSignsWithBothDuringOverlap(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
@@ -193,7 +234,7 @@ func TestReplay(t *testing.T) {
 	first := mustSend(t, s, app.ID, "a")
 	mustSend(t, s, app.ID, "a")
 
-	ds, _ := s.ListDeliveries(ctx, app.ID, first.Message.ID)
+	ds, _ := s.ListDeliveries(ctx, app.ID, first.Message.ID, "", 100)
 	if _, err := s.ReplayDelivery(ctx, app.ID, ds[0].ID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("replay of a pending delivery: %v, want ErrConflict", err)
 	}

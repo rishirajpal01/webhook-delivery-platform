@@ -12,22 +12,39 @@ import (
 	"github.com/rishirajpal01/webhook-delivery-platform/internal/postgres"
 )
 
-// TestNoisyNeighbour is the phase 3 exit gate: one endpoint answers slowly
-// and then fails, with a deep backlog; nine others are healthy. The healthy
-// endpoints' p99 lag (from a delivery becoming due to its first attempt)
-// must stay under one second.
+// TestNoisyNeighbour is the phase 3 exit gate from the design doc: one
+// endpoint answers in 10 s or returns 500, with a deep backlog; nine others
+// are healthy. The healthy endpoints' p99 lag (from a delivery being created
+// to its first attempt) must stay under one second.
 func TestNoisyNeighbour(t *testing.T) {
 	if testing.Short() {
 		t.Skip("noisy neighbour test skipped in -short mode")
 	}
+	tests := []struct {
+		name  string
+		noisy http.HandlerFunc
+	}{
+		{"answers in 10s", func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-time.After(10 * time.Second):
+			case <-r.Context().Done(): // the dispatcher stopped at the end of the test
+			}
+		}},
+		{"returns 500", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) { noisyNeighbour(t, tt.noisy) })
+	}
+}
+
+func noisyNeighbour(t *testing.T, noisyHandler http.HandlerFunc) {
 	f := newFixture(t)
 	ctx := context.Background()
 
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Second) // stands in for the doc's 10s, to keep the test short
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer slow.Close()
+	noisy := httptest.NewServer(noisyHandler)
+	defer noisy.Close()
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer healthy.Close()
 
@@ -48,7 +65,7 @@ func TestNoisyNeighbour(t *testing.T) {
 		}
 	}
 
-	endpoint(slow.URL, "noisy")
+	endpoint(noisy.URL, "noisy")
 	for range 500 {
 		send("noisy") // a backlog that, sent in order, would occupy every slot for minutes
 	}
@@ -56,7 +73,8 @@ func TestNoisyNeighbour(t *testing.T) {
 		endpoint(healthy.URL, "healthy")
 	}
 
-	f.run(t, Config{AllowPrivateNetworks: true, Concurrency: 16, RequestTimeout: 5 * time.Second})
+	// The default 15s request timeout, so a 10s answer is waited for.
+	f.run(t, Config{AllowPrivateNetworks: true, Concurrency: 16})
 	// 30 messages x 9 endpoints over 3 seconds: 90 deliveries/s, well under
 	// what the 12 slots the noisy endpoint can't take will carry even on a slow
 	// CI runner under -race. The test checks isolation, not throughput: run

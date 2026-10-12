@@ -48,17 +48,23 @@ attempt log:
 
 All `/v1` routes need `Authorization: Bearer $API_KEY`. Errors are
 [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json`.
+Every create (apps, endpoints, messages) honours an `Idempotency-Key` header:
+a repeat with the same key returns the first object with `200` and
+`Idempotent-Replayed: true` instead of creating another. Lists take
+`?limit=` (1 to 100, default 50) and `?cursor=`, and return `next_cursor`
+while more remain.
 
 | Method and path | Purpose |
 | --- | --- |
 | `POST /v1/apps` | Create an application `{"name"}` |
 | `GET /v1/apps/{app}` | Read an application |
 | `POST /v1/apps/{app}/endpoints` | Create an endpoint `{"url", "event_types"?, "secret"?, "max_in_flight"?, "rate_limit"?}`; returns the signing secret once |
-| `GET /v1/apps/{app}/endpoints?limit=&cursor=` | List endpoints |
+| `GET /v1/apps/{app}/endpoints` | List endpoints |
 | `GET`, `PATCH`, `DELETE /v1/apps/{app}/endpoints/{ep}` | Read, change (`url`, `event_types`, `status`: active or paused, `max_in_flight`, `rate_limit`) or delete an endpoint. Setting `active` also re-enables a disabled endpoint and clears its failure history |
 | `POST /v1/apps/{app}/endpoints/{ep}/secret/rotate` | New signing secret `{"secret"?}`, returned once; the old one keeps signing for 24 h |
-| `POST /v1/apps/{app}/endpoints/{ep}/replay` | Redeliver every `dead` delivery created since `{"since": "<RFC 3339>"}`; returns `{"replayed": n}` |
-| `POST /v1/apps/{app}/messages` | Send an event `{"event_type", "payload"}`; honours `Idempotency-Key` |
+| `POST /v1/apps/{app}/endpoints/{ep}/enable` | Re-enable a disabled endpoint and clear its failure history (same as `PATCH` with `"status": "active"`) |
+| `POST /v1/apps/{app}/endpoints/{ep}/replay?since=<RFC 3339>` | Redeliver every `dead` delivery created since then (a `{"since"}` body works too); returns `{"replayed": n}` |
+| `POST /v1/apps/{app}/messages` | Send an event `{"event_type", "payload"}` |
 | `GET /v1/apps/{app}/messages/{msg}/deliveries` | Where a message went and the state of each delivery |
 | `GET /v1/apps/{app}/deliveries/{del}/attempts` | Every attempt: status, latency, error, first 4 KB of the response |
 | `POST /v1/apps/{app}/deliveries/{del}/replay` | Send a `dead` or `succeeded` delivery again (409 while it is still pending) |
@@ -82,9 +88,11 @@ An endpoint with no `event_types` receives every event type.
   round-robin and skip any endpoint at its limit, so one slow or backlogged
   endpoint cannot hold up the rest. The limits live in Postgres and are
   enforced inside the claim, so they hold across all replicas.
-  `TestNoisyNeighbour` checks this: an endpoint that takes 2 s and then
-  fails, with 500 deliveries queued, leaves nine healthy endpoints at a p99
-  lag of about 25 ms (about 2 s with the cap lifted).
+  `TestNoisyNeighbour` checks this the way the design doc states it: an
+  endpoint that answers in 10 s, or one that returns 500, with 500
+  deliveries queued, leaves nine healthy endpoints at a p99 lag of about
+  30 ms. With the cap lifted the slow case fails: its backlog takes every
+  slot.
 
 - **Retries** on network errors, timeouts, redirects and any non-2xx, after
   5 s, 30 s, 2 m, 10 m, 30 m, 1 h, 3 h, 6 h and 12 h (each ±25% jitter), then
@@ -103,8 +111,12 @@ An endpoint with no `event_types` receives every event type.
   the wait doubles (up to 1 h), if it succeeds everything queued flows
   again. Other endpoints are unaffected.
 - **Auto-disable:** an endpoint that has failed continuously for 5 days is
-  set to `disabled` (`disabled_at` shows when). Its deliveries wait; set
-  `status` back to `active` to resume them.
+  set to `disabled` (`disabled_at` shows when). Its deliveries wait;
+  `POST …/enable` resumes them. The service also sends an
+  `endpoint.disabled` event in the endpoint's app, with payload
+  `{"endpoint_id", "url", "failing_since", "disabled_at"}`, to the app's
+  endpoints that list `endpoint.disabled` in their `event_types` (an empty
+  filter covers the operator's own events, not this one).
 - **Replay:** sends a delivery again with the same `webhook-id`, so receivers
   that already processed it can still drop it. It starts a fresh retry
   schedule.
@@ -119,7 +131,8 @@ An endpoint with no `event_types` receives every event type.
 | --- | --- | --- |
 | `DATABASE_URL` | none | Postgres connection string (required) |
 | `ROLE` | `all` | `api`, `dispatcher`, or `all` for both in one process |
-| `API_KEY` | none | Bearer token for `/v1`, at least 16 characters (required for `api` and `all`) |
+| `API_KEY` | none | Bearer token for `/v1`, at least 16 characters. The api role needs this or `API_KEY_SHA256` |
+| `API_KEY_SHA256` | none | The key's SHA-256 in hex (`printf %s "$KEY" \| sha256sum`), so the key itself is never stored in config. Only the hash is kept in memory either way |
 | `LISTEN_ADDR` | `:8080` | HTTP address; dispatchers serve only health and metrics |
 | `DISPATCHER_CONCURRENCY` | `16` | Deliveries one process sends at once |
 | `DISPATCHER_LEASE` | `30s` | How long a claimed delivery stays reserved; keep it above the 15 s request timeout |

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"slices"
 	"time"
+
+	"github.com/rishirajpal01/webhook-delivery-platform/internal/id"
 )
 
 // Job is a claimed delivery with everything needed to send it.
@@ -263,6 +265,9 @@ type CompleteResult struct {
 	Tripped bool
 	// Disabled is true when this failure disabled the endpoint.
 	Disabled bool
+	// DisabledEvent is the id of the endpoint.disabled message sent to the
+	// app's endpoints, set when Disabled is.
+	DisabledEvent string
 }
 
 // Complete records an attempt, moves the delivery to its next state and
@@ -336,8 +341,32 @@ func (s *Store) Complete(ctx context.Context, j Job, o Outcome, h HealthPolicy) 
 		if err != nil && !errors.Is(err, sql.ErrNoRows) { // no rows: endpoint deleted meanwhile
 			return r, err
 		}
+		if r.Disabled {
+			// In the same transaction, so the event is sent exactly once.
+			if r.DisabledEvent, err = sendDisabledEvent(ctx, tx, j.EndpointID); err != nil {
+				return r, err
+			}
+		}
 	}
 	return r, tx.Commit()
+}
+
+// sendDisabledEvent creates an endpoint.disabled message in the endpoint's
+// app and fans it out, returning the message id.
+func sendDisabledEvent(ctx context.Context, tx *sql.Tx, endpointID string) (string, error) {
+	msgID := id.New(id.Message)
+	var appID string
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO messages (id, app_id, event_type, payload)
+		SELECT $1, app_id, $3, jsonb_build_object(
+			'endpoint_id', id, 'url', url,
+			'failing_since', failing_since, 'disabled_at', disabled_at)
+		FROM endpoints WHERE id = $2
+		RETURNING app_id`, msgID, endpointID, EventEndpointDisabled).Scan(&appID); err != nil {
+		return "", err
+	}
+	_, err := fanOut(ctx, tx, msgID, appID, EventEndpointDisabled, false)
+	return msgID, err
 }
 
 // ReleaseExpired returns in_flight deliveries whose lease has passed to

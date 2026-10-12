@@ -339,7 +339,8 @@ func (d *Dispatcher) process(ctx context.Context, j postgres.Job) {
 	}
 	if r.Disabled {
 		endpointsDisabled.Inc()
-		log.Warn("endpoint disabled after failing continuously", "after", d.cfg.Health.DisableAfter.String())
+		log.Warn("endpoint disabled after failing continuously", "after", d.cfg.Health.DisableAfter.String(),
+			"event_message_id", r.DisabledEvent)
 	}
 }
 
