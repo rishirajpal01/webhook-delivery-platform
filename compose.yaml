@@ -1,6 +1,6 @@
 # Local stack: Postgres, the service, and a mock receiver to send webhooks to.
 #   docker compose up --build
-#   scripts/demo.sh
+#   then follow the README quickstart (scripts/quickstart.sh runs it)
 services:
   postgres:
     image: postgres:16-alpine
@@ -29,6 +29,13 @@ services:
       ALLOW_PRIVATE_NETWORKS: "true"
     ports:
       - "8080:8080"
+    # Healthy once migrations ran and /readyz answers, so
+    # "docker compose up --wait" returns only when the API is usable.
+    healthcheck:
+      test: ["CMD", "webhookd", "healthcheck"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,7 +59,7 @@ services:
     build: .
     entrypoint: ["mockreceiver"]
     # Fails 30% of requests (MOCK_FAIL_RATE) so retries are visible, and verifies signatures
-    # with the same secret scripts/demo.sh gives the endpoint.
+    # with the same secret the README quickstart gives the endpoint.
     command:
       - -addr=:9000
       - -fail-rate=${MOCK_FAIL_RATE:-0.3}

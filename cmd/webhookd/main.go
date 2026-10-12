@@ -3,6 +3,10 @@
 // ROLE picks what the process does: "api" serves the HTTP API, "dispatcher"
 // sends deliveries, and "all" (the default) does both. Any number of each can
 // run against one Postgres.
+//
+// "webhookd healthcheck" asks a running webhookd on LISTEN_ADDR whether it
+// is ready and exits 0 if so, for container health checks (the image has no
+// shell or curl).
 package main
 
 import (
@@ -12,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +27,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck(os.Getenv("LISTEN_ADDR")))
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
 		logger.Error("webhookd exited", "err", err)
@@ -105,4 +113,25 @@ func run(logger *slog.Logger) error {
 		}
 	}
 	return firstErr
+}
+
+// healthcheck returns 0 if the webhookd listening on addr (":8080" when
+// empty) answers /readyz with 200.
+func healthcheck(addr string) int {
+	if addr == "" {
+		addr = ":8080"
+	}
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	c := http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get("http://" + addr + "/readyz")
+	if err != nil {
+		return 1
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
 }

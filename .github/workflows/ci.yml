@@ -37,20 +37,17 @@ jobs:
       - name: Test
         run: make test
 
-  # The stack comes up from a clean checkout and delivers a signed webhook.
-  compose:
+  # Phase 4 exit gate: from a clean checkout, the README quickstart as
+  # written brings the stack up and gets a delivery the receiver verified.
+  quickstart:
     runs-on: ubuntu-latest
+    env:
+      # No random receiver failures, so the run is deterministic.
+      MOCK_FAIL_RATE: "0"
     steps:
       - uses: actions/checkout@v4
-      - name: Start stack
-        # No random failures here, so the end-to-end check is deterministic.
-        run: MOCK_FAIL_RATE=0 docker compose up --build -d --wait
-      - name: Check health
-        run: |
-          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://localhost:8080/readyz
-          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://localhost:9000/healthz
-      - name: Send a webhook end to end
-        run: scripts/demo.sh
+      - name: Run the README quickstart
+        run: scripts/quickstart.sh
       - name: Logs on failure
         if: failure()
         run: docker compose logs
