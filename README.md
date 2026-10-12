@@ -145,6 +145,26 @@ for the next 7 days at start and hourly, and drop the ones past retention.
 | `webhookd_endpoint_circuit_trips_total` | Times an endpoint's circuit breaker opened |
 | `webhookd_endpoints_disabled_total` | Endpoints disabled after failing continuously |
 
+## Benchmarks
+
+`scripts/bench.sh` runs `cmd/loadgen` against 1, 2 and 4 dispatcher
+replicas. Each message fans out to 20 endpoints (`max_in_flight` 4) on a
+receiver that takes 20 ms to answer, and each dispatcher sends 16 at once.
+Lag is end to end: from the send call starting to the delivery arriving.
+
+Measured on a 4-CPU Linux VM with Postgres, the API, the dispatchers and the
+load generator all on the same machine, so the 4-replica run is short of
+CPU. Every run delivered every message, with no duplicates.
+
+| Dispatchers | Burst throughput (60 000 deliveries) | Steady lag at 400 deliveries/s, p50 / p99 |
+| --- | --- | --- |
+| 1 | 576 deliveries/s | 21 ms / 195 ms |
+| 2 | 1 045 deliveries/s | 57 ms / 253 ms |
+| 4 | 1 458 deliveries/s | 72 ms / 247 ms |
+
+Steady lag is mostly the 250 ms poll interval: an idle dispatcher checks
+for new work four times a second.
+
 ## Develop
 
 Needs Go 1.25+. Postgres tests run when `DATABASE_URL` is set and skip
@@ -158,6 +178,9 @@ make down
 
 # The full crash test from the design doc:
 CRASH_TEST_MESSAGES=100000 CRASH_TEST_KILLS=8 go test -run Crash -timeout 10m ./cmd/webhookd
+
+# The replica benchmark (needs psql and a Postgres it can create databases on):
+ADMIN_URL=postgres://postgres@localhost:5432/postgres scripts/bench.sh
 ```
 
 ## Layout
