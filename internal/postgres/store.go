@@ -52,6 +52,11 @@ type Endpoint struct {
 	Secret     string   `json:"secret,omitempty"`
 	EventTypes []string `json:"event_types"`
 	Status     string   `json:"status"`
+	// MaxInFlight caps how many deliveries to this endpoint are sent at
+	// once, across all dispatchers. 0 on create means the default, 4.
+	MaxInFlight int `json:"max_in_flight"`
+	// RateLimit caps requests per second; 0 means unlimited.
+	RateLimit int `json:"rate_limit"`
 	// Health, maintained by the dispatcher.
 	ConsecutiveFailures int        `json:"consecutive_failures"`
 	FailingSince        *time.Time `json:"failing_since"`
@@ -127,12 +132,12 @@ func (s *Store) GetApp(ctx context.Context, appID string) (App, error) {
 // --- endpoints ---
 
 const endpointColumns = `id, app_id, url, secret, event_types, status,
-	consecutive_failures, failing_since, circuit_open_until, disabled_at, created_at, updated_at`
+	max_in_flight, coalesce(rate_limit, 0), consecutive_failures, failing_since, circuit_open_until, disabled_at, created_at, updated_at`
 
 func scanEndpoint(row interface{ Scan(...any) error }) (Endpoint, error) {
 	var e Endpoint
 	err := row.Scan(&e.ID, &e.AppID, &e.URL, &e.Secret,
-		pgtype.NewMap().SQLScanner(&e.EventTypes), &e.Status,
+		pgtype.NewMap().SQLScanner(&e.EventTypes), &e.Status, &e.MaxInFlight, &e.RateLimit,
 		&e.ConsecutiveFailures, &e.FailingSince, &e.CircuitOpenUntil, &e.DisabledAt,
 		&e.CreatedAt, &e.UpdatedAt)
 	return e, err
@@ -144,10 +149,11 @@ func (s *Store) CreateEndpoint(ctx context.Context, e Endpoint) (Endpoint, error
 		e.EventTypes = []string{}
 	}
 	row := s.db.QueryRowContext(ctx, `
-		INSERT INTO endpoints (id, app_id, url, secret, event_types)
-		SELECT $1, $2, $3, $4, $5 WHERE EXISTS (SELECT 1 FROM applications WHERE id = $2)
+		INSERT INTO endpoints (id, app_id, url, secret, event_types, max_in_flight, rate_limit)
+		SELECT $1, $2, $3, $4, $5, coalesce(nullif($6, 0), 4), nullif($7, 0)
+		WHERE EXISTS (SELECT 1 FROM applications WHERE id = $2)
 		RETURNING `+endpointColumns,
-		id.New(id.Endpoint), e.AppID, e.URL, e.Secret, e.EventTypes)
+		id.New(id.Endpoint), e.AppID, e.URL, e.Secret, e.EventTypes, e.MaxInFlight, e.RateLimit)
 	created, err := scanEndpoint(row)
 	return created, notFound(err)
 }
@@ -183,9 +189,11 @@ func (s *Store) ListEndpoints(ctx context.Context, appID, after string, limit in
 
 // EndpointPatch holds the fields an update may change; nil means unchanged.
 type EndpointPatch struct {
-	URL        *string
-	EventTypes *[]string
-	Status     *string
+	URL         *string
+	EventTypes  *[]string
+	Status      *string
+	MaxInFlight *int
+	RateLimit   *int // 0 removes the limit
 }
 
 // UpdateEndpoint applies a patch and returns the updated endpoint. Setting
@@ -197,6 +205,8 @@ func (s *Store) UpdateEndpoint(ctx context.Context, appID, endpointID string, p 
 			url         = COALESCE($3, url),
 			event_types = COALESCE($4, event_types),
 			status      = COALESCE($5, status),
+			max_in_flight = COALESCE($6, max_in_flight),
+			rate_limit    = CASE WHEN $7::integer IS NULL THEN rate_limit ELSE nullif($7, 0) END,
 			consecutive_failures = CASE WHEN $5 = 'active' THEN 0 ELSE consecutive_failures END,
 			failing_since        = CASE WHEN $5 = 'active' THEN NULL ELSE failing_since END,
 			circuit_open_until   = CASE WHEN $5 = 'active' THEN NULL ELSE circuit_open_until END,
@@ -204,7 +214,7 @@ func (s *Store) UpdateEndpoint(ctx context.Context, appID, endpointID string, p 
 			updated_at  = now()
 		WHERE app_id = $1 AND id = $2
 		RETURNING `+endpointColumns,
-		appID, endpointID, p.URL, p.EventTypes, p.Status)
+		appID, endpointID, p.URL, p.EventTypes, p.Status, p.MaxInFlight, p.RateLimit)
 	e, err := scanEndpoint(row)
 	return e, notFound(err)
 }

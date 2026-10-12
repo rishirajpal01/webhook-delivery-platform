@@ -206,7 +206,15 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			}()
 		}
 		if len(jobs) < free {
-			sleep(ctx, d.cfg.PollInterval)
+			// Nothing else is claimable now. Wait for work to come due, or
+			// for a send to finish: that may free an endpoint's slot.
+			t := time.NewTimer(d.cfg.PollInterval)
+			select {
+			case <-ctx.Done():
+			case <-d.slotFreed:
+			case <-t.C:
+			}
+			t.Stop()
 		}
 	}
 	d.logger.Info("dispatcher draining", "in_flight", len(sem))

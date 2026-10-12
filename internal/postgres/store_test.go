@@ -297,7 +297,10 @@ func TestConcurrentClaimersNeverShareADelivery(t *testing.T) {
 	ctx := context.Background()
 	app := mustApp(t, s)
 	for range 4 {
-		mustEndpoint(t, s, app.ID)
+		// Room for every delivery: this test is about claims, not caps.
+		if _, err := s.CreateEndpoint(ctx, Endpoint{AppID: app.ID, URL: "https://x.io", Secret: "s", MaxInFlight: 100}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for range 50 {
 		mustSend(t, s, app.ID, "a") // 50 messages x 4 endpoints = 200 deliveries

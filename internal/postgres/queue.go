@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"time"
 )
 
@@ -29,13 +30,111 @@ type Job struct {
 	LockedUntil time.Time
 }
 
-// Claim leases up to limit due deliveries for lease. Rows locked by another
-// dispatcher are skipped rather than waited on, so any number of dispatchers
-// can claim side by side. Deliveries to paused or disabled endpoints, and to
-// endpoints whose circuit breaker is open, stay pending.
+// Claim leases up to limit due deliveries for lease, sharing them fairly
+// between endpoints. Endpoints are served round-robin, least recently
+// served first, and each gets no more than its free concurrency slots and
+// rate-limit tokens, so a backlog on one endpoint never holds up another.
+//
+// Each picked endpoint's row is locked for the claim and claimers skip
+// locked rows, so any number of dispatchers can claim side by side and the
+// limits still hold across all of them. Deliveries to paused or disabled
+// endpoints, and to endpoints whose circuit breaker is open, stay pending.
 func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Job, error) {
-	return s.claim(ctx, limit, lease,
-		`d.endpoint_id IN (SELECT id FROM endpoints WHERE status = 'active' AND circuit_open_until IS NULL)`)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// A rate-limited endpoint has rate_limit tokens per second and holds at
+	// most one second's worth; rate_tat tracks how many are spent.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT e.id, least(e.max_in_flight - f.n, due.n, CASE WHEN e.rate_limit IS NULL THEN $1 ELSE
+		           floor(extract(epoch FROM now() + interval '1 second' - greatest(e.rate_tat, now())) * e.rate_limit) END)::int
+		FROM endpoints e
+		CROSS JOIN LATERAL (SELECT count(*) AS n FROM deliveries d
+		                    WHERE d.endpoint_id = e.id AND d.state = 'in_flight') f
+		-- Due work, counted only up to limit so a large backlog stays cheap.
+		CROSS JOIN LATERAL (SELECT count(*) AS n FROM (
+		                        SELECT 1 FROM deliveries d
+		                        WHERE d.endpoint_id = e.id AND d.state = 'pending' AND d.next_attempt_at <= now()
+		                        LIMIT $1) x) due
+		WHERE e.status = 'active' AND e.circuit_open_until IS NULL
+		  AND e.max_in_flight > f.n AND due.n > 0
+		  AND (e.rate_limit IS NULL OR e.rate_tat <= now() + interval '1 second' - interval '1 second' / e.rate_limit)
+		ORDER BY e.last_claimed_at NULLS FIRST, e.id
+		LIMIT $1
+		FOR UPDATE OF e SKIP LOCKED`, limit)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		endpointIDs []string
+		room        []int
+	)
+	for rows.Next() {
+		var (
+			id string
+			n  int
+		)
+		if err := rows.Scan(&id, &n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		endpointIDs = append(endpointIDs, id)
+		room = append(room, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(endpointIDs) == 0 {
+		return nil, err
+	}
+
+	jobs, err := claim(ctx, tx, lease, `
+		SELECT p.id FROM unnest($2::text[], $3::int[]) AS q(endpoint_id, n)
+		CROSS JOIN LATERAL (
+			SELECT d.id FROM deliveries d
+			WHERE d.endpoint_id = q.endpoint_id AND d.state = 'pending' AND d.next_attempt_at <= now()
+			ORDER BY d.next_attempt_at
+			LIMIT q.n
+			FOR UPDATE SKIP LOCKED) p`, endpointIDs, shareOut(limit, room))
+	if err != nil {
+		return nil, err
+	}
+
+	taken := make([]int, len(endpointIDs))
+	for _, j := range jobs {
+		taken[slices.Index(endpointIDs, j.EndpointID)]++
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE endpoints e SET
+			last_claimed_at = now(),
+			rate_tat = CASE WHEN e.rate_limit IS NULL THEN e.rate_tat
+			                ELSE greatest(e.rate_tat, now()) + c.n * interval '1 second' / e.rate_limit END
+		FROM unnest($1::text[], $2::int[]) AS c(id, n)
+		WHERE e.id = c.id`, endpointIDs, taken); err != nil {
+		return nil, err
+	}
+	return jobs, tx.Commit()
+}
+
+// shareOut splits limit slots between endpoints one at a time, round-robin,
+// giving each no more than its room (free slots, tokens and due work).
+func shareOut(limit int, room []int) []int {
+	share := make([]int, len(room))
+	for limit > 0 {
+		given := false
+		for i := range room {
+			if limit > 0 && share[i] < room[i] {
+				share[i]++
+				limit--
+				given = true
+			}
+		}
+		if !given {
+			break
+		}
+	}
+	return share
 }
 
 // ClaimProbes picks up to limit endpoints whose circuit breaker cool-down has
@@ -73,7 +172,12 @@ func (s *Store) ClaimProbes(ctx context.Context, limit int, lease time.Duration)
 
 	var jobs []Job
 	for _, id := range endpointIDs {
-		js, err := s.claim(ctx, 1, lease, `d.endpoint_id = $3`, id)
+		js, err := claim(ctx, s.db, lease, `
+			SELECT d.id FROM deliveries d
+			WHERE d.endpoint_id = $2 AND d.state = 'pending' AND d.next_attempt_at <= now()
+			ORDER BY d.next_attempt_at
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED`, id)
 		if err != nil {
 			return jobs, err
 		}
@@ -85,19 +189,18 @@ func (s *Store) ClaimProbes(ctx context.Context, limit int, lease time.Duration)
 	return jobs, nil
 }
 
-// claim leases up to limit due deliveries matching filter, a SQL condition
-// on d (deliveries) whose own parameters start at $3.
-func (s *Store) claim(ctx context.Context, limit int, lease time.Duration, filter string, args ...any) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// claim leases the deliveries whose ids pick selects. pick must lock the
+// rows it returns with FOR UPDATE SKIP LOCKED; its own parameters start at $2.
+func claim(ctx context.Context, q querier, lease time.Duration, pick string, args ...any) ([]Job, error) {
+	rows, err := q.QueryContext(ctx, `
 		WITH claimed AS (
 			UPDATE deliveries
-			SET state = 'in_flight', locked_until = now() + $2::bigint * interval '1 millisecond', updated_at = now()
-			WHERE id = ANY (ARRAY(
-				SELECT d.id FROM deliveries d
-				WHERE d.state = 'pending' AND d.next_attempt_at <= now() AND `+filter+`
-				ORDER BY d.next_attempt_at
-				LIMIT $1
-				FOR UPDATE SKIP LOCKED))
+			SET state = 'in_flight', locked_until = now() + $1::bigint * interval '1 millisecond', updated_at = now()
+			WHERE id = ANY (ARRAY(`+pick+`))
 			RETURNING id, message_id, endpoint_id, attempt_count, next_attempt_at, locked_until
 		)
 		SELECT c.id, c.message_id, c.endpoint_id, c.attempt_count, c.next_attempt_at, c.locked_until,
@@ -106,7 +209,7 @@ func (s *Store) claim(ctx context.Context, limit int, lease time.Duration, filte
 		FROM claimed c
 		JOIN messages m ON m.id = c.message_id
 		JOIN endpoints e ON e.id = c.endpoint_id`,
-		append([]any{limit, lease.Milliseconds()}, args...)...)
+		append([]any{lease.Milliseconds()}, args...)...)
 	if err != nil {
 		return nil, err
 	}

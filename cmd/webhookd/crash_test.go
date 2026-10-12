@@ -60,6 +60,7 @@ func TestCrashLosesNothing(t *testing.T) {
 	}
 	if _, err := store.CreateEndpoint(ctx, postgres.Endpoint{
 		AppID: app.ID, URL: receiver.URL, Secret: signing.NewSecret(),
+		MaxInFlight: 32, // as many as the dispatcher sends at once
 	}); err != nil {
 		t.Fatal(err)
 	}

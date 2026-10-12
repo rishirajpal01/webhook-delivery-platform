@@ -57,9 +57,11 @@ func (s *server) getApp(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		URL        string   `json:"url"`
-		EventTypes []string `json:"event_types"`
-		Secret     string   `json:"secret"`
+		URL         string   `json:"url"`
+		EventTypes  []string `json:"event_types"`
+		Secret      string   `json:"secret"`
+		MaxInFlight *int     `json:"max_in_flight"`
+		RateLimit   *int     `json:"rate_limit"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -72,6 +74,10 @@ func (s *server) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnprocessableEntity, msg)
 		return
 	}
+	if msg := validateLimits(req.MaxInFlight, req.RateLimit); msg != "" {
+		problem(w, http.StatusUnprocessableEntity, msg)
+		return
+	}
 	if req.Secret == "" {
 		req.Secret = signing.NewSecret()
 	} else if !signing.ValidSecret(req.Secret) {
@@ -79,9 +85,14 @@ func (s *server) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ep, err := s.store.CreateEndpoint(r.Context(), postgres.Endpoint{
-		AppID: r.PathValue("app"), URL: req.URL, EventTypes: req.EventTypes, Secret: req.Secret,
-	})
+	ep := postgres.Endpoint{AppID: r.PathValue("app"), URL: req.URL, EventTypes: req.EventTypes, Secret: req.Secret}
+	if req.MaxInFlight != nil {
+		ep.MaxInFlight = *req.MaxInFlight
+	}
+	if req.RateLimit != nil {
+		ep.RateLimit = *req.RateLimit
+	}
+	ep, err := s.store.CreateEndpoint(r.Context(), ep)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -133,9 +144,11 @@ func (s *server) getEndpoint(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) updateEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		URL        *string   `json:"url"`
-		EventTypes *[]string `json:"event_types"`
-		Status     *string   `json:"status"`
+		URL         *string   `json:"url"`
+		EventTypes  *[]string `json:"event_types"`
+		Status      *string   `json:"status"`
+		MaxInFlight *int      `json:"max_in_flight"`
+		RateLimit   *int      `json:"rate_limit"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -152,6 +165,10 @@ func (s *server) updateEndpoint(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if msg := validateLimits(req.MaxInFlight, req.RateLimit); msg != "" {
+		problem(w, http.StatusUnprocessableEntity, msg)
+		return
+	}
 	// "disabled" is set by the service when an endpoint keeps failing.
 	if req.Status != nil && *req.Status != postgres.EndpointActive && *req.Status != postgres.EndpointPaused {
 		problem(w, http.StatusUnprocessableEntity, `status must be "active" or "paused"`)
@@ -160,6 +177,7 @@ func (s *server) updateEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	ep, err := s.store.UpdateEndpoint(r.Context(), r.PathValue("app"), r.PathValue("ep"), postgres.EndpointPatch{
 		URL: req.URL, EventTypes: req.EventTypes, Status: req.Status,
+		MaxInFlight: req.MaxInFlight, RateLimit: req.RateLimit,
 	})
 	if err != nil {
 		s.fail(w, r, err)
@@ -322,6 +340,18 @@ func validateEventTypes(types []string) string {
 		if t == "" || len(t) > maxNameLen {
 			return fmt.Sprintf("event type %q must be 1 to 255 bytes", t)
 		}
+	}
+	return ""
+}
+
+// validateLimits checks an endpoint's concurrency cap and rate limit (nil
+// means not given).
+func validateLimits(maxInFlight, rateLimit *int) string {
+	if maxInFlight != nil && (*maxInFlight < 1 || *maxInFlight > 100) {
+		return "max_in_flight must be between 1 and 100"
+	}
+	if rateLimit != nil && (*rateLimit < 0 || *rateLimit > 10000) {
+		return "rate_limit must be between 0 (unlimited) and 10000 requests per second"
 	}
 	return ""
 }

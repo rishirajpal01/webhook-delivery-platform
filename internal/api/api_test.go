@@ -139,9 +139,12 @@ func TestSendFlow(t *testing.T) {
 		t.Fatalf("attempts = %+v, want none yet", as.Data)
 	}
 
+	if ep.MaxInFlight != 4 || ep.RateLimit != 0 {
+		t.Fatalf("default limits = %d in flight, %d/s", ep.MaxInFlight, ep.RateLimit)
+	}
 	var patched postgres.Endpoint
-	c.expect(c.do("PATCH", base+"/endpoints/"+ep.ID, `{"status":"paused"}`, &patched), http.StatusOK)
-	if patched.Status != "paused" || len(patched.EventTypes) != 1 {
+	c.expect(c.do("PATCH", base+"/endpoints/"+ep.ID, `{"status":"paused","max_in_flight":10,"rate_limit":50}`, &patched), http.StatusOK)
+	if patched.Status != "paused" || len(patched.EventTypes) != 1 || patched.MaxInFlight != 10 || patched.RateLimit != 50 {
 		t.Fatalf("patched = %+v", patched)
 	}
 
@@ -189,6 +192,10 @@ func TestValidationAndNotFound(t *testing.T) {
 		{"deliveries of missing message", "GET", base + "/messages/msg_x/deliveries", "", 404},
 		{"attempts of missing delivery", "GET", base + "/deliveries/del_x/attempts", "", 404},
 		{"bad limit", "GET", base + "/endpoints?limit=500", "", 400},
+		{"max_in_flight too low", "POST", base + "/endpoints", `{"url":"https://x.io","max_in_flight":0}`, 422},
+		{"max_in_flight too high", "POST", base + "/endpoints", `{"url":"https://x.io","max_in_flight":101}`, 422},
+		{"negative rate_limit", "POST", base + "/endpoints", `{"url":"https://x.io","rate_limit":-1}`, 422},
+		{"patch bad max_in_flight", "PATCH", base + "/endpoints/ep_x", `{"max_in_flight":0}`, 422},
 		{"list endpoints of missing app", "GET", "/v1/apps/app_missing/endpoints", "", 404},
 		{"replay missing delivery", "POST", base + "/deliveries/del_x/replay", "", 404},
 		{"replay endpoint without since", "POST", base + "/endpoints/ep_x/replay", `{}`, 422},

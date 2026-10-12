@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 )
 
 type fixture struct {
+	db     *sql.DB
 	store  *postgres.Store
 	app    postgres.App
 	secret string
@@ -34,7 +36,7 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return fixture{store: s, app: app, secret: signing.NewSecret()}
+	return fixture{db: db, store: s, app: app, secret: signing.NewSecret()}
 }
 
 // send registers url as the app's only endpoint and sends one message to it.
