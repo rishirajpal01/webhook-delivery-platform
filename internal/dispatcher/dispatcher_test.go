@@ -111,7 +111,9 @@ func TestDeliversSignedRequest(t *testing.T) {
 		if err != nil {
 			verifyErr.Store(err)
 		}
-		if r.Header.Get("Content-Type") != "application/json" || !strings.Contains(string(body), "981") {
+		if r.Header.Get("Content-Type") != "application/json" ||
+			!strings.HasPrefix(string(body), `{"type":"order.paid","timestamp":"`) ||
+			!strings.HasSuffix(string(body), `"data":{"order":"981"}}`) {
 			verifyErr.Store("unexpected request")
 		}
 		io.WriteString(w, "thanks")

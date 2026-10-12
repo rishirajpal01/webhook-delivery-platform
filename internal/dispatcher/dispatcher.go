@@ -9,6 +9,7 @@ package dispatcher
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -356,20 +357,24 @@ func (d *Dispatcher) send(ctx context.Context, j postgres.Job) (postgres.Attempt
 		return a, 0
 	}
 
-	sig, err := signing.Sign(j.Secret, j.MessageID, start, j.Payload)
+	body, err := envelope(j)
+	if err != nil {
+		return fail(err)
+	}
+	sig, err := signing.Sign(j.Secret, j.MessageID, start, body)
 	if err != nil {
 		return fail(err)
 	}
 	if j.PreviousSecret != "" {
 		// During rotation, sign with the old secret too; receivers accept a
 		// request if any signature matches.
-		old, err := signing.Sign(j.PreviousSecret, j.MessageID, start, j.Payload)
+		old, err := signing.Sign(j.PreviousSecret, j.MessageID, start, body)
 		if err != nil {
 			return fail(err)
 		}
 		sig += " " + old
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, j.URL, bytes.NewReader(j.Payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, j.URL, bytes.NewReader(body))
 	if err != nil {
 		return fail(err)
 	}
@@ -383,7 +388,7 @@ func (d *Dispatcher) send(ctx context.Context, j postgres.Job) (postgres.Attempt
 	if err != nil {
 		return fail(err)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 	// Drain a little more so the connection can be reused, then close.
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
@@ -393,7 +398,7 @@ func (d *Dispatcher) send(ctx context.Context, j postgres.Job) (postgres.Attempt
 	code := resp.StatusCode
 	a.StatusCode = &code
 	// Postgres text cannot hold invalid UTF-8 or NUL bytes.
-	a.ResponseBody = strings.ReplaceAll(string(bytes.ToValidUTF8(body, []byte("\uFFFD"))), "\x00", "")
+	a.ResponseBody = strings.ReplaceAll(string(bytes.ToValidUTF8(respBody, []byte("\uFFFD"))), "\x00", "")
 
 	var retryAfter time.Duration
 	if code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable {
@@ -427,4 +432,15 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-t.C:
 	}
+}
+
+// envelope is the request body: the payload structure Standard Webhooks
+// recommends, so the event type is covered by the signature. It is the same
+// on every attempt, so receivers can deduplicate on webhook-id.
+func envelope(j postgres.Job) ([]byte, error) {
+	return json.Marshal(struct {
+		Type      string          `json:"type"`
+		Timestamp time.Time       `json:"timestamp"`
+		Data      json.RawMessage `json:"data"`
+	}{j.EventType, j.CreatedAt.UTC(), j.Payload})
 }

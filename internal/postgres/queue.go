@@ -19,6 +19,7 @@ type Job struct {
 	DueAt        time.Time // when the delivery became due; lag = claim time - DueAt
 	EventType    string
 	Payload      []byte
+	CreatedAt    time.Time // when the message was created
 	URL          string
 	Secret       string
 	// PreviousSecret is set while a rotated-out secret is still valid; the
@@ -207,7 +208,7 @@ func claim(ctx context.Context, q querier, lease time.Duration, pick string, arg
 			RETURNING id, message_id, endpoint_id, attempt_count, next_attempt_at, locked_until
 		)
 		SELECT c.id, c.message_id, c.endpoint_id, c.attempt_count, c.next_attempt_at, c.locked_until,
-		       m.event_type, m.payload::text, e.url, e.secret,
+		       m.event_type, m.payload::text, m.created_at, e.url, e.secret,
 		       CASE WHEN e.previous_secret_expires_at > now() THEN e.previous_secret ELSE '' END
 		FROM claimed c
 		JOIN messages m ON m.id = c.message_id
@@ -225,7 +226,7 @@ func claim(ctx context.Context, q querier, lease time.Duration, pick string, arg
 			payload string
 		)
 		if err := rows.Scan(&j.DeliveryID, &j.MessageID, &j.EndpointID, &j.AttemptCount, &j.DueAt,
-			&j.LockedUntil, &j.EventType, &payload, &j.URL, &j.Secret, &j.PreviousSecret); err != nil {
+			&j.LockedUntil, &j.EventType, &payload, &j.CreatedAt, &j.URL, &j.Secret, &j.PreviousSecret); err != nil {
 			return nil, err
 		}
 		j.Payload = []byte(payload)
