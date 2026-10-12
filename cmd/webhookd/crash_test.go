@@ -106,9 +106,19 @@ func TestCrashLosesNothing(t *testing.T) {
 		return n
 	}
 
+	// A killed dispatcher's leases fill the endpoint's in-flight slots until
+	// they expire, so its successor sends nothing for up to a lease. Each kill
+	// waits for the new dispatcher to make progress, so it lands mid-send.
 	for i := range kills {
+		before := remaining()
 		cmd := start()
-		time.Sleep(time.Duration(200+rand.IntN(600)) * time.Millisecond)
+		for deadline := time.Now().Add(30 * time.Second); remaining() == before; {
+			if time.Now().After(deadline) {
+				t.Fatalf("kill %d: dispatcher made no progress", i+1)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		time.Sleep(time.Duration(rand.IntN(300)) * time.Millisecond)
 		cmd.Process.Signal(syscall.SIGKILL)
 		cmd.Wait()
 		t.Logf("kill %d: %d deliveries not yet succeeded", i+1, remaining())
