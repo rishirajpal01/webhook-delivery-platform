@@ -7,6 +7,16 @@ and recording every attempt.
 
 One Go binary plus Postgres. No Kafka, Redis or Kubernetes required.
 
+<a href="docs/architecture/README.md">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/architecture-dark.png" />
+    <img src="docs/architecture/architecture-light.png" alt="Architecture: your product sends to webhookd's API, which writes the message and its deliveries to Postgres in one transaction; dispatchers claim deliveries with SKIP LOCKED and a lease, record each attempt in a day-partitioned log, and send signed requests through an SSRF guard to receivers." />
+  </picture>
+</a>
+
+The interactive version, with every box linked to its source, is
+[docs/architecture/index.html](docs/architecture/index.html).
+
 > **Status: v1.0.** Everything in the design doc
 > works: sending, fan-out, retries, signing, the attempt log, the SSRF guard,
 > replay, circuit breaking, secret rotation, per-endpoint concurrency and rate
@@ -59,6 +69,7 @@ stops everything. To receive webhooks in your own code, see
 
 | Page | For |
 | --- | --- |
+| [docs/architecture](docs/architecture/README.md) | An interactive architecture diagram, linked to the source |
 | [docs/receiving.md](docs/receiving.md) | Receivers: the request format, verifying signatures, answering, retries |
 | [docs/api.md](docs/api.md) and [docs/openapi.json](docs/openapi.json) | The HTTP API: routes, idempotency, pagination, errors |
 | [docs/sdk-and-cli.md](docs/sdk-and-cli.md) | The Go SDK and `webhookctl` |

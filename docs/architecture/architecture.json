@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Webhook Delivery Platform",
+    "output": "docs/architecture/index.html",
+    "quality_profile": "showcase",
+    "locale": "en",
+    "repository": {
+      "url": "https://github.com/rishirajpal01/webhook-delivery-platform",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "aa13e9c056f2b9c28465528087ab61137f24454c"
+    }
+  },
+  "components": [
+    { "id": "cli", "type": "frontend", "label": "Go SDK · webhookctl", "sublabel": "typed client and CLI", "pos": [410, 30], "size": [170, 64],
+      "sources": [
+        { "path": "webhooks/client.go", "line": 159, "end_line": 165, "label": "Client.SendMessage" },
+        { "path": "cmd/webhookctl/main.go", "line": 204, "end_line": 215, "label": "webhookctl send" }
+      ] },
+    { "id": "producer", "type": "external", "label": "Your product", "sublabel": "sends each event once", "pos": [40, 190], "size": [150, 64],
+      "sources": [
+        { "path": "internal/api/handlers.go", "line": 295, "end_line": 300, "label": "sendMessage handler" }
+      ] },
+    { "id": "api", "type": "backend", "label": "webhookd · api", "sublabel": "REST v1, bearer key", "pos": [410, 190], "size": [170, 64],
+      "sources": [
+        { "path": "cmd/webhookd/main.go", "line": 64, "end_line": 69, "label": "ROLE=api serves /v1" },
+        { "path": "internal/api/api.go", "line": 108, "end_line": 121, "label": "requireKey" }
+      ] },
+    { "id": "queue", "type": "database", "label": "Postgres queue", "sublabel": "messages · deliveries · endpoints", "pos": [800, 190], "size": [200, 64],
+      "sources": [
+        { "path": "internal/postgres/store.go", "line": 303, "end_line": 330, "label": "CreateMessage: one tx" },
+        { "path": "internal/postgres/queue.go", "line": 40, "end_line": 50, "label": "Claim: SKIP LOCKED" }
+      ] },
+    { "id": "attempts", "type": "database", "label": "Attempt log", "sublabel": "partitioned by UTC day", "pos": [410, 400], "size": [170, 64],
+      "sources": [
+        { "path": "internal/postgres/migrations/0004_partition_attempts.sql", "line": 1, "end_line": 6, "label": "daily partitions" },
+        { "path": "internal/postgres/queue.go", "line": 279, "end_line": 292, "label": "Complete writes attempt" }
+      ] },
+    { "id": "dispatcher", "type": "backend", "label": "webhookd · dispatcher", "sublabel": "fair claim, sign, retry", "pos": [800, 400], "size": [200, 64], "tag": "any number of replicas",
+      "sources": [
+        { "path": "internal/dispatcher/dispatcher.go", "line": 241, "end_line": 254, "label": "claim" },
+        { "path": "internal/dispatcher/dispatcher.go", "line": 293, "end_line": 340, "label": "process: retry or dead" },
+        { "path": "internal/dispatcher/dispatcher.go", "line": 350, "end_line": 390, "label": "send: sign and POST" }
+      ] },
+    { "id": "ssrf", "type": "security", "label": "SSRF guard", "sublabel": "public addresses only", "pos": [1100, 400], "size": [160, 64],
+      "sources": [
+        { "path": "internal/ssrf/ssrf.go", "line": 47, "end_line": 52, "label": "NewDialer" },
+        { "path": "internal/dispatcher/dispatcher.go", "line": 138, "end_line": 140, "label": "client uses the dialer" }
+      ] },
+    { "id": "receiver", "type": "external", "label": "Receiver endpoint", "sublabel": "webhooks.VerifyRequest", "pos": [1370, 400], "size": [170, 64],
+      "sources": [
+        { "path": "webhooks/verify.go", "line": 49, "end_line": 55, "label": "VerifyRequest" }
+      ] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Self-hosted: one webhookd binary + Postgres", "wraps": ["api", "queue", "attempts", "dispatcher", "ssrf"] }
+  ],
+  "connections": [
+    { "id": "send-event", "from": "producer", "to": "api", "label": "POST /v1/apps/{app}/messages", "variant": "emphasis" },
+    { "id": "sdk-calls", "from": "cli", "to": "api", "label": "HTTPS + Bearer" },
+    { "id": "store-message", "from": "api", "to": "queue", "label": "1 tx: message + deliveries", "variant": "emphasis" },
+    { "id": "claim", "from": "dispatcher", "to": "queue", "label": "claim: SKIP LOCKED + lease", "variant": "emphasis" },
+    { "id": "record-attempt", "from": "dispatcher", "to": "attempts", "label": "record attempt" },
+    { "id": "dial", "from": "dispatcher", "to": "ssrf", "label": "dial" },
+    { "id": "deliver", "from": "ssrf", "to": "receiver", "label": "signed POST", "variant": "emphasis" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "Guarantees", "items": ["At-least-once, unordered; webhook-id is the message id", "Message and deliveries written in one transaction", "Crash test: 100 000 messages, 8 kill -9s, none lost"] },
+    { "dot": "cyan", "title": "Fairness", "items": ["Round-robin claim across endpoints", "Per-endpoint max_in_flight (default 4) and GCRA rate limit", "Limits hold across any number of dispatchers"] },
+    { "dot": "amber", "title": "Failure handling", "items": ["Backoff with ±25% jitter over about 24 h, then dead", "Honours Retry-After on 429 and 503", "Circuit breaker after 10 failures; auto-disable after 5 days"] },
+    { "dot": "rose", "title": "Security", "items": ["Standard Webhooks HMAC signatures", "24 h dual signing during secret rotation", "SSRF guard refuses private addresses"] }
+  ]
+}
