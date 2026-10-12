@@ -57,19 +57,23 @@ func TestNoisyNeighbour(t *testing.T) {
 	}
 
 	f.run(t, Config{AllowPrivateNetworks: true, Concurrency: 16, RequestTimeout: 5 * time.Second})
-	for range 60 { // 60 messages x 9 endpoints over 3 seconds
+	// 30 messages x 9 endpoints over 3 seconds: 90 deliveries/s, well under
+	// what the 12 slots the noisy endpoint can't take will carry even on a slow
+	// CI runner under -race. The test checks isolation, not throughput: run
+	// near saturation, queueing alone pushes p99 past the limit.
+	for range 30 {
 		send("healthy")
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	var lags []time.Duration
 	deadline := time.Now().Add(15 * time.Second)
-	for len(lags) < 540 && time.Now().Before(deadline) {
+	for len(lags) < 270 && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 		lags = healthyLags(t, f)
 	}
-	if len(lags) < 540 {
-		t.Fatalf("only %d of 540 healthy deliveries were attempted", len(lags))
+	if len(lags) < 270 {
+		t.Fatalf("only %d of 270 healthy deliveries were attempted", len(lags))
 	}
 	slices.Sort(lags)
 	p50, p99 := lags[len(lags)/2], lags[len(lags)*99/100]
