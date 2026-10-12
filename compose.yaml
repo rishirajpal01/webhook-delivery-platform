@@ -34,6 +34,20 @@ services:
         condition: service_healthy
     restart: on-failure
 
+  # Extra dispatcher replicas, off by default:
+  #   docker compose --profile scale up --build --scale dispatcher=3
+  dispatcher:
+    profiles: [scale]
+    build: .
+    environment:
+      DATABASE_URL: postgres://webhooks:webhooks@postgres:5432/webhooks?sslmode=disable
+      ROLE: dispatcher
+      ALLOW_PRIVATE_NETWORKS: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
   mockreceiver:
     build: .
     entrypoint: ["mockreceiver"]
