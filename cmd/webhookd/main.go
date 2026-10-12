@@ -75,6 +75,7 @@ func run(logger *slog.Logger) error {
 			Concurrency:          cfg.DispatcherConcurrency,
 			Lease:                cfg.DispatcherLease,
 			AllowPrivateNetworks: cfg.AllowPrivateNetworks,
+			AttemptRetentionDays: cfg.AttemptRetentionDays,
 		}, logger)
 		if cfg.AllowPrivateNetworks {
 			logger.Warn("SSRF guard is off: deliveries may reach private networks")

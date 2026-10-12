@@ -35,6 +35,9 @@ type Config struct {
 	// AllowPrivateNetworks lets deliveries reach private and loopback
 	// addresses. For local development only; it disables the SSRF guard.
 	AllowPrivateNetworks bool
+	// AttemptRetentionDays is how many days of the attempt log dispatchers
+	// keep; older days are dropped. 0 keeps everything.
+	AttemptRetentionDays int
 }
 
 // RunsAPI reports whether this process serves the HTTP API.
@@ -54,6 +57,7 @@ func Load(getenv func(string) string) (Config, error) {
 		ShutdownTimeout:       10 * time.Second,
 		DispatcherConcurrency: 16,
 		DispatcherLease:       30 * time.Second,
+		AttemptRetentionDays:  30,
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL is required")
@@ -97,6 +101,13 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, errors.New("ALLOW_PRIVATE_NETWORKS must be true or false")
 		}
 		cfg.AllowPrivateNetworks = b
+	}
+	if v := getenv("ATTEMPT_RETENTION_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return Config{}, errors.New("ATTEMPT_RETENTION_DAYS must be a whole number of days, 0 to keep everything")
+		}
+		cfg.AttemptRetentionDays = n
 	}
 	return cfg, nil
 }

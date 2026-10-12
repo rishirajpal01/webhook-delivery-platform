@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -71,6 +72,9 @@ type Config struct {
 	Schedule       []time.Duration // retry delays; default DefaultSchedule
 	// AllowPrivateNetworks turns off the SSRF guard. Local development only.
 	AllowPrivateNetworks bool
+	// AttemptRetentionDays is how many days of the attempt log to keep;
+	// 0 keeps everything.
+	AttemptRetentionDays int
 	// Health decides when an endpoint's circuit breaker trips and when it is
 	// disabled. Defaults: trip after 10 failures in a row, cool down for 1m
 	// doubling to 1h between probes, disable after 5 days of failure.
@@ -155,21 +159,27 @@ func newHTTPClient(timeout time.Duration, concurrency int, allowPrivate bool) *h
 // sends already started to finish (each is bounded by RequestTimeout).
 func (d *Dispatcher) Run(ctx context.Context) error {
 	d.logger.Info("dispatcher started", "concurrency", d.cfg.Concurrency, "lease", d.cfg.Lease.String())
+	// Attempts can only be recorded on days that have a partition, so make
+	// sure they exist before sending anything.
+	d.maintainPartitions(ctx)
+
 	sem := make(chan struct{}, d.cfg.Concurrency)
-	done := make(chan struct{})
+	var background sync.WaitGroup
 	defer func() {
 		// Fill every slot: this returns once all running sends are done.
 		for range cap(sem) {
 			sem <- struct{}{}
 		}
-		<-done
+		background.Wait()
 		d.logger.Info("dispatcher stopped")
 	}()
 
-	go func() {
-		defer close(done)
-		d.releaseExpiredLoop(ctx)
-	}()
+	background.Go(func() { d.releaseExpiredLoop(ctx) })
+	background.Go(func() {
+		for sleep(ctx, time.Hour); ctx.Err() == nil; sleep(ctx, time.Hour) {
+			d.maintainPartitions(ctx)
+		}
+	})
 
 	for ctx.Err() == nil {
 		// Only this loop adds to sem, so `free` slots are guaranteed free.
@@ -236,6 +246,21 @@ func (d *Dispatcher) claim(ctx context.Context, free int) ([]postgres.Job, error
 		}
 	}
 	return jobs, nil
+}
+
+// maintainPartitions creates the coming days' attempt log partitions and
+// drops the ones past retention.
+func (d *Dispatcher) maintainPartitions(ctx context.Context) {
+	created, dropped, err := d.store.MaintainAttemptPartitions(ctx, d.cfg.AttemptRetentionDays)
+	if err != nil {
+		if ctx.Err() == nil {
+			d.logger.Error("attempt partition maintenance failed", "err", err)
+		}
+		return
+	}
+	if created > 0 || dropped > 0 {
+		d.logger.Info("attempt partitions maintained", "created", created, "dropped", dropped)
+	}
 }
 
 func (d *Dispatcher) releaseExpiredLoop(ctx context.Context) {

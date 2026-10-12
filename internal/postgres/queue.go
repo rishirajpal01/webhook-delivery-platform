@@ -352,3 +352,21 @@ func (s *Store) ReleaseExpired(ctx context.Context) (int, error) {
 	n, err := res.RowsAffected()
 	return int(n), err
 }
+
+// MaintainAttemptPartitions creates the attempt log's daily partitions for
+// today and the next 7 days (UTC), and drops those older than retentionDays
+// (0 keeps everything). Inserting an attempt for a day with no partition
+// fails, so dispatchers call this at start and then regularly.
+func (s *Store) MaintainAttemptPartitions(ctx context.Context, retentionDays int) (created, dropped int, err error) {
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT create_attempt_partitions((now() AT TIME ZONE 'UTC')::date, (now() AT TIME ZONE 'UTC')::date + 7)`).
+		Scan(&created); err != nil {
+		return 0, 0, err
+	}
+	if retentionDays > 0 {
+		err = s.db.QueryRowContext(ctx, `
+			SELECT drop_attempt_partitions((now() AT TIME ZONE 'UTC')::date - $1::integer)`, retentionDays).
+			Scan(&dropped)
+	}
+	return created, dropped, err
+}
