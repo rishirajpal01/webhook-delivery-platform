@@ -164,6 +164,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	d.maintainPartitions(ctx)
 
 	sem := make(chan struct{}, d.cfg.Concurrency)
+	minBatch := max(1, d.cfg.Concurrency/4)
 	var background sync.WaitGroup
 	defer func() {
 		// Fill every slot: this returns once all running sends are done.
@@ -183,8 +184,11 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 	for ctx.Err() == nil {
 		// Only this loop adds to sem, so `free` slots are guaranteed free.
+		// While sends are running, wait until a quarter of the slots are
+		// free: claiming one delivery per finished send would make the
+		// claim queries, not the sends, the limit on throughput.
 		free := cap(sem) - len(sem)
-		if free == 0 {
+		if free == 0 || (free < minBatch && len(sem) > 0) {
 			select {
 			case <-ctx.Done():
 			case <-d.slotFreed:

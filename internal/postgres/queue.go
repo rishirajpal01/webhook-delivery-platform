@@ -37,7 +37,8 @@ type Job struct {
 //
 // Each picked endpoint's row is locked for the claim and claimers skip
 // locked rows, so any number of dispatchers can claim side by side and the
-// limits still hold across all of them. Deliveries to paused or disabled
+// limits still hold across all of them. The locks are FOR NO KEY UPDATE, so
+// they do not block foreign-key checks from sends inserting deliveries. Deliveries to paused or disabled
 // endpoints, and to endpoints whose circuit breaker is open, stay pending.
 func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -64,7 +65,7 @@ func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Jo
 		  AND (e.rate_limit IS NULL OR e.rate_tat <= now() + interval '1 second' - interval '1 second' / e.rate_limit)
 		ORDER BY e.last_claimed_at NULLS FIRST, e.id
 		LIMIT $1
-		FOR UPDATE OF e SKIP LOCKED`, limit)
+		FOR NO KEY UPDATE OF e SKIP LOCKED`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +97,7 @@ func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Jo
 			WHERE d.endpoint_id = q.endpoint_id AND d.state = 'pending' AND d.next_attempt_at <= now()
 			ORDER BY d.next_attempt_at
 			LIMIT q.n
-			FOR UPDATE SKIP LOCKED) p`, endpointIDs, shareOut(limit, room))
+			FOR NO KEY UPDATE SKIP LOCKED) p`, endpointIDs, shareOut(limit, room))
 	if err != nil {
 		return nil, err
 	}

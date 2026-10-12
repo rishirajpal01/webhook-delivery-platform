@@ -3,8 +3,8 @@
 #
 # For each replica count it recreates the database, starts one api process
 # and the dispatchers, then runs loadgen twice:
-#   burst:  sends MESSAGES messages as fast as possible -> throughput
 #   steady: sends at RATE messages/s                    -> lag under normal load
+#   burst:  sends MESSAGES messages as fast as possible -> throughput
 #
 # Needs Go and psql, and a Postgres where ADMIN_URL can create databases.
 #
@@ -41,7 +41,7 @@ for n in $REPLICAS; do
   sleep 1
 
   echo; echo "== $n dispatcher replica(s) =="
-  for mode in burst steady; do
+  for mode in steady burst; do
     if [ $mode = burst ]; then args=(-messages "$MESSAGES"); else args=(-messages "$STEADY" -rate "$RATE"); fi
     printf '%s: ' $mode
     "$bin/loadgen" -api http://localhost:8090 -key $KEY -endpoints "$ENDPOINTS" -latency "$LATENCY" "${args[@]}" | tail -2 | paste -sd" " -
