@@ -14,6 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/rishirajpal01/webhook-delivery-platform/docs"
 	"github.com/rishirajpal01/webhook-delivery-platform/internal/postgres"
 )
 
@@ -34,6 +35,7 @@ type server struct {
 //	GET /healthz  liveness: the process is up and serving
 //	GET /readyz   readiness: the process can reach Postgres
 //	GET /metrics  Prometheus metrics
+//	GET /openapi.json  the API description
 func NewOpsHandler(db Pinger, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	addOpsRoutes(mux, db, logger)
@@ -49,23 +51,38 @@ func NewHandler(db Pinger, store *postgres.Store, keyHash [32]byte, logger *slog
 	addOpsRoutes(mux, db, logger)
 
 	v1 := http.NewServeMux()
-	v1.HandleFunc("POST /v1/apps", s.createApp)
-	v1.HandleFunc("GET /v1/apps/{app}", s.getApp)
-	v1.HandleFunc("POST /v1/apps/{app}/endpoints", s.createEndpoint)
-	v1.HandleFunc("GET /v1/apps/{app}/endpoints", s.listEndpoints)
-	v1.HandleFunc("GET /v1/apps/{app}/endpoints/{ep}", s.getEndpoint)
-	v1.HandleFunc("PATCH /v1/apps/{app}/endpoints/{ep}", s.updateEndpoint)
-	v1.HandleFunc("DELETE /v1/apps/{app}/endpoints/{ep}", s.deleteEndpoint)
-	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/secret/rotate", s.rotateSecret)
-	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/enable", s.enableEndpoint)
-	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/replay", s.replayEndpoint)
-	v1.HandleFunc("POST /v1/apps/{app}/messages", s.sendMessage)
-	v1.HandleFunc("GET /v1/apps/{app}/messages/{msg}/deliveries", s.listDeliveries)
-	v1.HandleFunc("GET /v1/apps/{app}/deliveries/{del}/attempts", s.listAttempts)
-	v1.HandleFunc("POST /v1/apps/{app}/deliveries/{del}/replay", s.replayDelivery)
+	for _, rt := range s.routes() {
+		v1.HandleFunc(rt.pattern, rt.handler)
+	}
 	mux.Handle("/v1/", s.requireKey(v1))
 
 	return mux
+}
+
+// route is one /v1 operation. The table is what docs/openapi.json describes;
+// a contract test checks the two match.
+type route struct {
+	pattern string // "METHOD /path", as http.ServeMux takes it
+	handler http.HandlerFunc
+}
+
+func (s *server) routes() []route {
+	return []route{
+		{"POST /v1/apps", s.createApp},
+		{"GET /v1/apps/{app}", s.getApp},
+		{"POST /v1/apps/{app}/endpoints", s.createEndpoint},
+		{"GET /v1/apps/{app}/endpoints", s.listEndpoints},
+		{"GET /v1/apps/{app}/endpoints/{ep}", s.getEndpoint},
+		{"PATCH /v1/apps/{app}/endpoints/{ep}", s.updateEndpoint},
+		{"DELETE /v1/apps/{app}/endpoints/{ep}", s.deleteEndpoint},
+		{"POST /v1/apps/{app}/endpoints/{ep}/secret/rotate", s.rotateSecret},
+		{"POST /v1/apps/{app}/endpoints/{ep}/enable", s.enableEndpoint},
+		{"POST /v1/apps/{app}/endpoints/{ep}/replay", s.replayEndpoint},
+		{"POST /v1/apps/{app}/messages", s.sendMessage},
+		{"GET /v1/apps/{app}/messages/{msg}/deliveries", s.listDeliveries},
+		{"GET /v1/apps/{app}/deliveries/{del}/attempts", s.listAttempts},
+		{"POST /v1/apps/{app}/deliveries/{del}/replay", s.replayDelivery},
+	}
 }
 
 func addOpsRoutes(mux *http.ServeMux, db Pinger, logger *slog.Logger) {
@@ -83,6 +100,10 @@ func addOpsRoutes(mux *http.ServeMux, db Pinger, logger *slog.Logger) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(docs.OpenAPI)
+	})
 }
 
 // requireKey checks the bearer token. Both sides are hashed first so the

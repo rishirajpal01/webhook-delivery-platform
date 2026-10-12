@@ -23,12 +23,50 @@ var messagesCreated = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Messages accepted by the API, not counting idempotent repeats.",
 })
 
+// Request bodies, named so the contract test can check them against
+// docs/openapi.json.
+type (
+	createAppRequest struct {
+		Name string `json:"name"`
+	}
+	createEndpointRequest struct {
+		URL         string   `json:"url"`
+		EventTypes  []string `json:"event_types"`
+		Secret      string   `json:"secret"`
+		MaxInFlight *int     `json:"max_in_flight"`
+		RateLimit   *int     `json:"rate_limit"`
+	}
+	updateEndpointRequest struct {
+		URL         *string   `json:"url"`
+		EventTypes  *[]string `json:"event_types"`
+		Status      *string   `json:"status"`
+		MaxInFlight *int      `json:"max_in_flight"`
+		RateLimit   *int      `json:"rate_limit"`
+	}
+	rotateSecretRequest struct {
+		Secret string `json:"secret"`
+	}
+	replayEndpointRequest struct {
+		Since *time.Time `json:"since"`
+	}
+	sendMessageRequest struct {
+		EventType string          `json:"event_type"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	// sendMessageResponse is what a send returns.
+	sendMessageResponse struct {
+		ID         string `json:"id"`
+		Deliveries int    `json:"deliveries"`
+	}
+	replayEndpointResponse struct {
+		Replayed int `json:"replayed"`
+	}
+)
+
 // --- applications ---
 
 func (s *server) createApp(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name string `json:"name"`
-	}
+	var req createAppRequest
 	if !decode(w, r, &req) {
 		return
 	}
@@ -60,13 +98,7 @@ func (s *server) getApp(w http.ResponseWriter, r *http.Request) {
 // --- endpoints ---
 
 func (s *server) createEndpoint(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		URL         string   `json:"url"`
-		EventTypes  []string `json:"event_types"`
-		Secret      string   `json:"secret"`
-		MaxInFlight *int     `json:"max_in_flight"`
-		RateLimit   *int     `json:"rate_limit"`
-	}
+	var req createEndpointRequest
 	if !decode(w, r, &req) {
 		return
 	}
@@ -161,13 +193,7 @@ func (s *server) getEndpoint(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) updateEndpoint(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		URL         *string   `json:"url"`
-		EventTypes  *[]string `json:"event_types"`
-		Status      *string   `json:"status"`
-		MaxInFlight *int      `json:"max_in_flight"`
-		RateLimit   *int      `json:"rate_limit"`
-	}
+	var req updateEndpointRequest
 	if !decode(w, r, &req) {
 		return
 	}
@@ -218,9 +244,7 @@ func (s *server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 const rotationOverlap = 24 * time.Hour
 
 func (s *server) rotateSecret(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Secret string `json:"secret"`
-	}
+	var req rotateSecretRequest
 	if r.ContentLength != 0 && !decode(w, r, &req) { // the body is optional
 		return
 	}
@@ -243,9 +267,7 @@ func (s *server) rotateSecret(w http.ResponseWriter, r *http.Request) {
 // or after ?since=<RFC 3339 time>, e.g. after the receiver's outage is fixed.
 // A JSON body {"since": ...} is accepted too.
 func (s *server) replayEndpoint(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Since *time.Time `json:"since"`
-	}
+	var req replayEndpointRequest
 	if v := r.URL.Query().Get("since"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
@@ -265,16 +287,13 @@ func (s *server) replayEndpoint(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]int{"replayed": n})
+	writeJSON(w, http.StatusAccepted, replayEndpointResponse{Replayed: n})
 }
 
 // --- messages ---
 
 func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		EventType string          `json:"event_type"`
-		Payload   json.RawMessage `json:"payload"`
-	}
+	var req sendMessageRequest
 	if !decode(w, r, &req) {
 		return
 	}
@@ -307,7 +326,7 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	} else {
 		messagesCreated.Inc()
 	}
-	writeJSON(w, status, map[string]any{"id": res.Message.ID, "deliveries": res.Deliveries})
+	writeJSON(w, status, sendMessageResponse{ID: res.Message.ID, Deliveries: res.Deliveries})
 }
 
 func (s *server) listDeliveries(w http.ResponseWriter, r *http.Request) {
