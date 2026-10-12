@@ -7,10 +7,12 @@ and recording every attempt.
 
 One Go binary plus Postgres. No Kafka, Redis or Kubernetes required.
 
-> **Status: phase 2 (reliability).** Sending, fan-out, retries, signing, the
-> attempt log and the SSRF guard work, plus replay, a per-endpoint circuit
-> breaker, auto-disable, `Retry-After`, secret rotation and graceful drain.
-> Per-endpoint fairness comes in phase 3.
+> **Status: phase 3 (fairness and scale).** Sending, fan-out, retries,
+> signing, the attempt log, the SSRF guard, replay, circuit breaking and
+> secret rotation work, plus per-endpoint concurrency and rate limits that
+> hold across any number of dispatcher replicas, a partitioned attempt log
+> with retention, and a load generator. The OpenAPI spec, Go SDK and CLI come
+> in phase 4.
 
 ## Guarantees
 
@@ -51,9 +53,9 @@ All `/v1` routes need `Authorization: Bearer $API_KEY`. Errors are
 | --- | --- |
 | `POST /v1/apps` | Create an application `{"name"}` |
 | `GET /v1/apps/{app}` | Read an application |
-| `POST /v1/apps/{app}/endpoints` | Create an endpoint `{"url", "event_types"?, "secret"?}`; returns the signing secret once |
+| `POST /v1/apps/{app}/endpoints` | Create an endpoint `{"url", "event_types"?, "secret"?, "max_in_flight"?, "rate_limit"?}`; returns the signing secret once |
 | `GET /v1/apps/{app}/endpoints?limit=&cursor=` | List endpoints |
-| `GET`, `PATCH`, `DELETE /v1/apps/{app}/endpoints/{ep}` | Read, change (`url`, `event_types`, `status`: active or paused) or delete an endpoint. Setting `active` also re-enables a disabled endpoint and clears its failure history |
+| `GET`, `PATCH`, `DELETE /v1/apps/{app}/endpoints/{ep}` | Read, change (`url`, `event_types`, `status`: active or paused, `max_in_flight`, `rate_limit`) or delete an endpoint. Setting `active` also re-enables a disabled endpoint and clears its failure history |
 | `POST /v1/apps/{app}/endpoints/{ep}/secret/rotate` | New signing secret `{"secret"?}`, returned once; the old one keeps signing for 24 h |
 | `POST /v1/apps/{app}/endpoints/{ep}/replay` | Redeliver every `dead` delivery created since `{"since": "<RFC 3339>"}`; returns `{"replayed": n}` |
 | `POST /v1/apps/{app}/messages` | Send an event `{"event_type", "payload"}`; honours `Idempotency-Key` |
@@ -73,6 +75,16 @@ curl -X POST localhost:8080/v1/apps/$APP/messages \
 An endpoint with no `event_types` receives every event type.
 
 ## Delivery behaviour
+
+- **Fairness:** each endpoint gets at most `max_in_flight` concurrent sends
+  (default 4, up to 100) and, if `rate_limit` is set, that many requests per
+  second (bursts of up to one second's worth). Dispatchers serve endpoints
+  round-robin and skip any endpoint at its limit, so one slow or backlogged
+  endpoint cannot hold up the rest. The limits live in Postgres and are
+  enforced inside the claim, so they hold across all replicas.
+  `TestNoisyNeighbour` checks this: an endpoint that takes 2 s and then
+  fails, with 500 deliveries queued, leaves nine healthy endpoints at a p99
+  lag of about 25 ms (about 2 s with the cap lifted).
 
 - **Retries** on network errors, timeouts, redirects and any non-2xx, after
   5 s, 30 s, 2 m, 10 m, 30 m, 1 h, 3 h, 6 h and 12 h (each ±25% jitter), then
@@ -113,8 +125,13 @@ An endpoint with no `event_types` receives every event type.
 | `DISPATCHER_LEASE` | `30s` | How long a claimed delivery stays reserved; keep it above the 15 s request timeout |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | Turns the SSRF guard off. Local development only |
 | `SHUTDOWN_TIMEOUT` | `10s` | Time in-flight HTTP requests get on shutdown |
+| `ATTEMPT_RETENTION_DAYS` | `30` | Days of the attempt log to keep; older days are dropped whole. `0` keeps everything |
 
 Any number of `api` and `dispatcher` processes can run against one Postgres.
+With compose: `docker compose --profile scale up --build --scale dispatcher=3`.
+
+The attempt log is partitioned by day (UTC). Dispatchers create partitions
+for the next 7 days at start and hourly, and drop the ones past retention.
 
 ## Metrics
 
@@ -149,12 +166,14 @@ CRASH_TEST_MESSAGES=100000 CRASH_TEST_KILLS=8 go test -run Crash -timeout 10m ./
 cmd/webhookd         the service (api and dispatcher roles)
 cmd/mockreceiver     a receiver for demos and tests (-fail-rate, -latency, -secret)
 internal/api         HTTP routes, auth, validation
+cmd/loadgen          load generator with its own receiver (throughput and lag)
 internal/dispatcher  claim, send, retry, circuit breaker
 internal/postgres    connection, migrations, queries
 internal/signing     Standard Webhooks sign and verify
 internal/ssrf        dialer that refuses non-public addresses
 internal/config      environment config
 scripts/demo.sh      end-to-end walkthrough (also run in CI)
+scripts/bench.sh     benchmark with 1, 2 and 4 dispatcher replicas
 ```
 
 ## Roadmap
@@ -164,7 +183,7 @@ scripts/demo.sh      end-to-end walkthrough (also run in CI)
 | 0 · Foundations ✓ | Layout, CI, compose, migrations, mock receiver |
 | 1 · Core delivery ✓ | Apps, endpoints, send with idempotency, fan-out, dispatcher with leases, retries, signing, attempt log, SSRF guard, metrics |
 | 2 · Reliability ✓ | Replay, circuit breaker and auto-disable, `Retry-After`, secret rotation, graceful drain |
-| 3 · Fairness and scale | Per-endpoint concurrency and rate limits, multiple dispatchers, partitioned attempts, load generator |
+| 3 · Fairness and scale ✓ | Per-endpoint concurrency and rate limits, multiple dispatchers, partitioned attempts, load generator |
 | 4 · Developer experience | OpenAPI spec, Go SDK, `Verify()` helper, CLI |
 | 5 · Launch | Benchmarks in this README, write-up, v1.0 |
 
