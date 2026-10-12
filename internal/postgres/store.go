@@ -27,6 +27,12 @@ const (
 	EndpointDisabled = "disabled"
 )
 
+// EventEndpointDisabled is the type of the message the service sends when it
+// disables an endpoint that kept failing. Only endpoints that list it in
+// their event types receive it; an empty filter means every type the
+// operator sends, not the service's own events.
+const EventEndpointDisabled = "endpoint.disabled"
+
 // Delivery states.
 const (
 	DeliveryPending   = "pending"
@@ -113,11 +119,29 @@ func NewStore(db *sql.DB) *Store {
 
 // CreateApp creates an application.
 func (s *Store) CreateApp(ctx context.Context, name string) (App, error) {
-	a := App{ID: id.New(id.App), Name: name}
-	err := s.db.QueryRowContext(ctx,
-		`INSERT INTO applications (id, name) VALUES ($1, $2) RETURNING created_at`,
-		a.ID, a.Name).Scan(&a.CreatedAt)
+	a, _, err := s.CreateAppIdempotent(ctx, name, "")
 	return a, err
+}
+
+// CreateAppIdempotent creates an application. With a non-empty key, a second
+// call with the same key returns the first application and reports
+// duplicate, creating nothing.
+func (s *Store) CreateAppIdempotent(ctx context.Context, name, key string) (a App, duplicate bool, err error) {
+	a = App{ID: id.New(id.App), Name: name}
+	err = s.db.QueryRowContext(ctx, `
+		INSERT INTO applications (id, name, idempotency_key) VALUES ($1, $2, nullif($3, ''))
+		ON CONFLICT (idempotency_key) DO NOTHING
+		RETURNING created_at`,
+		a.ID, a.Name, key).Scan(&a.CreatedAt)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return a, false, err
+	}
+	// The key was used before. ON CONFLICT waited for that insert to commit,
+	// so the original row is visible to this next statement.
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id, name, created_at FROM applications WHERE idempotency_key = $1`, key).
+		Scan(&a.ID, &a.Name, &a.CreatedAt)
+	return a, true, err
 }
 
 // GetApp returns one application.
@@ -145,17 +169,33 @@ func scanEndpoint(row interface{ Scan(...any) error }) (Endpoint, error) {
 
 // CreateEndpoint creates an endpoint. e.ID and timestamps are filled in.
 func (s *Store) CreateEndpoint(ctx context.Context, e Endpoint) (Endpoint, error) {
+	created, _, err := s.CreateEndpointIdempotent(ctx, e, "")
+	return created, err
+}
+
+// CreateEndpointIdempotent creates an endpoint. With a non-empty key, a
+// second call with the same key for the same app returns the first endpoint
+// (secret included) and reports duplicate, creating nothing.
+func (s *Store) CreateEndpointIdempotent(ctx context.Context, e Endpoint, key string) (created Endpoint, duplicate bool, err error) {
 	if e.EventTypes == nil {
 		e.EventTypes = []string{}
 	}
 	row := s.db.QueryRowContext(ctx, `
-		INSERT INTO endpoints (id, app_id, url, secret, event_types, max_in_flight, rate_limit)
-		SELECT $1, $2, $3, $4, $5, coalesce(nullif($6, 0), 4), nullif($7, 0)
+		INSERT INTO endpoints (id, app_id, url, secret, event_types, max_in_flight, rate_limit, idempotency_key)
+		SELECT $1, $2, $3, $4, $5, coalesce(nullif($6, 0), 4), nullif($7, 0), nullif($8, '')
 		WHERE EXISTS (SELECT 1 FROM applications WHERE id = $2)
+		ON CONFLICT (app_id, idempotency_key) DO NOTHING
 		RETURNING `+endpointColumns,
-		id.New(id.Endpoint), e.AppID, e.URL, e.Secret, e.EventTypes, e.MaxInFlight, e.RateLimit)
-	created, err := scanEndpoint(row)
-	return created, notFound(err)
+		id.New(id.Endpoint), e.AppID, e.URL, e.Secret, e.EventTypes, e.MaxInFlight, e.RateLimit, key)
+	created, err = scanEndpoint(row)
+	if !errors.Is(err, sql.ErrNoRows) || key == "" {
+		return created, false, notFound(err)
+	}
+	// No row: either the app does not exist or the key was used before.
+	row = s.db.QueryRowContext(ctx,
+		`SELECT `+endpointColumns+` FROM endpoints WHERE app_id = $1 AND idempotency_key = $2`, e.AppID, key)
+	created, err = scanEndpoint(row)
+	return created, err == nil, notFound(err)
 }
 
 // GetEndpoint returns one endpoint of an app.
@@ -299,21 +339,32 @@ func (s *Store) CreateMessage(ctx context.Context, m Message) (SendResult, error
 		return SendResult{}, err
 	}
 
+	n, err := fanOut(ctx, tx, m.ID, m.AppID, m.EventType, true)
+	if err != nil {
+		return SendResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SendResult{}, err
+	}
+	return SendResult{Message: m, Deliveries: n}, nil
+}
+
+// fanOut creates one pending delivery of a message per active endpoint of
+// the app subscribed to its event type, and returns how many. Endpoints with
+// an empty filter receive every type only when wildcard is true.
+func fanOut(ctx context.Context, tx *sql.Tx, messageID, appID, eventType string, wildcard bool) (int, error) {
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO deliveries (id, message_id, endpoint_id)
 		SELECT 'del_' || replace(gen_random_uuid()::text, '-', ''), $1, e.id
 		FROM endpoints e
 		WHERE e.app_id = $2 AND e.status = 'active'
-		  AND (cardinality(e.event_types) = 0 OR $3 = ANY (e.event_types))`,
-		m.ID, m.AppID, m.EventType)
+		  AND (($4::boolean AND cardinality(e.event_types) = 0) OR $3 = ANY (e.event_types))`,
+		messageID, appID, eventType, wildcard)
 	if err != nil {
-		return SendResult{}, err
+		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	if err := tx.Commit(); err != nil {
-		return SendResult{}, err
-	}
-	return SendResult{Message: m, Deliveries: int(n)}, nil
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 func (s *Store) existingMessage(ctx context.Context, tx *sql.Tx, appID, key string) (SendResult, error) {
@@ -388,8 +439,9 @@ func (s *Store) ReplayEndpoint(ctx context.Context, appID, endpointID string, si
 
 // --- delivery log ---
 
-// ListDeliveries returns every delivery of one message.
-func (s *Store) ListDeliveries(ctx context.Context, appID, messageID string) ([]Delivery, error) {
+// ListDeliveries returns up to limit deliveries of one message with ids
+// after the cursor (empty for the first page), ordered by id.
+func (s *Store) ListDeliveries(ctx context.Context, appID, messageID, after string, limit int) ([]Delivery, error) {
 	var found bool
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM messages WHERE app_id = $1 AND id = $2)`,
@@ -402,7 +454,7 @@ func (s *Store) ListDeliveries(ctx context.Context, appID, messageID string) ([]
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+deliveryColumns+` FROM deliveries d
-		WHERE d.message_id = $1 ORDER BY d.created_at, d.id`, messageID)
+		WHERE d.message_id = $1 AND d.id > $2 ORDER BY d.id LIMIT $3`, messageID, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -418,8 +470,9 @@ func (s *Store) ListDeliveries(ctx context.Context, appID, messageID string) ([]
 	return out, rows.Err()
 }
 
-// ListAttempts returns the attempt log of one delivery, oldest first.
-func (s *Store) ListAttempts(ctx context.Context, appID, deliveryID string) ([]Attempt, error) {
+// ListAttempts returns up to limit attempts of one delivery with ids after
+// the cursor (0 for the first page), oldest first.
+func (s *Store) ListAttempts(ctx context.Context, appID, deliveryID string, after int64, limit int) ([]Attempt, error) {
 	var found bool
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT EXISTS (SELECT 1 FROM deliveries d JOIN messages m ON m.id = d.message_id
@@ -433,7 +486,7 @@ func (s *Store) ListAttempts(ctx context.Context, appID, deliveryID string) ([]A
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, delivery_id, attempted_at, status_code, latency_ms,
 		       coalesce(error, ''), coalesce(response_body, '')
-		FROM attempts WHERE delivery_id = $1 ORDER BY attempted_at, id`, deliveryID)
+		FROM attempts WHERE delivery_id = $1 AND id > $2 ORDER BY id LIMIT $3`, deliveryID, after, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -41,9 +41,10 @@ func NewOpsHandler(db Pinger, logger *slog.Logger) http.Handler {
 }
 
 // NewHandler serves the operational routes plus the API. Everything under
-// /v1 requires "Authorization: Bearer <apiKey>".
-func NewHandler(db Pinger, store *postgres.Store, apiKey string, logger *slog.Logger) http.Handler {
-	s := &server{store: store, keyHash: sha256.Sum256([]byte(apiKey)), logger: logger}
+// /v1 requires "Authorization: Bearer <key>", where keyHash is the key's
+// SHA-256.
+func NewHandler(db Pinger, store *postgres.Store, keyHash [32]byte, logger *slog.Logger) http.Handler {
+	s := &server{store: store, keyHash: keyHash, logger: logger}
 	mux := http.NewServeMux()
 	addOpsRoutes(mux, db, logger)
 
@@ -56,6 +57,7 @@ func NewHandler(db Pinger, store *postgres.Store, apiKey string, logger *slog.Lo
 	v1.HandleFunc("PATCH /v1/apps/{app}/endpoints/{ep}", s.updateEndpoint)
 	v1.HandleFunc("DELETE /v1/apps/{app}/endpoints/{ep}", s.deleteEndpoint)
 	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/secret/rotate", s.rotateSecret)
+	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/enable", s.enableEndpoint)
 	v1.HandleFunc("POST /v1/apps/{app}/endpoints/{ep}/replay", s.replayEndpoint)
 	v1.HandleFunc("POST /v1/apps/{app}/messages", s.sendMessage)
 	v1.HandleFunc("GET /v1/apps/{app}/messages/{msg}/deliveries", s.listDeliveries)

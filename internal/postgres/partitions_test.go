@@ -37,7 +37,7 @@ func TestAttemptPartitionsAndRetention(t *testing.T) {
 	}, testPolicy); err != nil {
 		t.Fatal(err)
 	}
-	as, _ := s.ListAttempts(ctx, app.ID, jobs[0].DeliveryID)
+	as, _ := s.ListAttempts(ctx, app.ID, jobs[0].DeliveryID, 0, 100)
 	if len(as) != 1 {
 		t.Fatalf("attempts = %d, want 1", len(as))
 	}
@@ -48,7 +48,7 @@ func TestAttemptPartitionsAndRetention(t *testing.T) {
 	if _, dropped, err := s.MaintainAttemptPartitions(ctx, 30); err != nil || dropped != 1 {
 		t.Fatalf("dropped %d, %v; want the 40-day-old partition", dropped, err)
 	}
-	if as, _ := s.ListAttempts(ctx, app.ID, jobs[0].DeliveryID); len(as) != 0 {
+	if as, _ := s.ListAttempts(ctx, app.ID, jobs[0].DeliveryID, 0, 100); len(as) != 0 {
 		t.Fatalf("attempts after retention = %d, want 0", len(as))
 	}
 }
@@ -85,7 +85,7 @@ func TestMigrationKeepsExistingAttempts(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewStore(db)
-	as, err := s.ListAttempts(ctx, "app_1", "del_1")
+	as, err := s.ListAttempts(ctx, "app_1", "del_1", 0, 100)
 	if err != nil || len(as) != 2 || as[0].LatencyMS != 1 || as[1].LatencyMS != 2 {
 		t.Fatalf("attempts after migrating = %+v, %v", as, err)
 	}

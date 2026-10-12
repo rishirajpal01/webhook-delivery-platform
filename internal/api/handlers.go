@@ -36,12 +36,16 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnprocessableEntity, "name is required and must be at most 255 bytes")
 		return
 	}
-	app, err := s.store.CreateApp(r.Context(), req.Name)
+	key, ok := idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	app, dup, err := s.store.CreateAppIdempotent(r.Context(), req.Name, key)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, app)
+	writeCreated(w, dup, app)
 }
 
 func (s *server) getApp(w http.ResponseWriter, r *http.Request) {
@@ -92,25 +96,24 @@ func (s *server) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	if req.RateLimit != nil {
 		ep.RateLimit = *req.RateLimit
 	}
-	ep, err := s.store.CreateEndpoint(r.Context(), ep)
+	key, ok := idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	ep, dup, err := s.store.CreateEndpointIdempotent(r.Context(), ep, key)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	// The secret is returned once, here, so the operator can hand it to the
-	// receiver.
-	writeJSON(w, http.StatusCreated, ep)
+	// The secret is returned here, on create (and on an idempotent repeat of
+	// it), so the operator can hand it to the receiver.
+	writeCreated(w, dup, ep)
 }
 
 func (s *server) listEndpoints(w http.ResponseWriter, r *http.Request) {
-	limit := 50
-	if v := r.URL.Query().Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 100 {
-			problem(w, http.StatusBadRequest, "limit must be between 1 and 100")
-			return
-		}
-		limit = n
+	limit, ok := pageLimit(w, r)
+	if !ok {
+		return
 	}
 	appID := r.PathValue("app")
 	if _, err := s.store.GetApp(r.Context(), appID); err != nil {
@@ -130,6 +133,21 @@ func (s *server) listEndpoints(w http.ResponseWriter, r *http.Request) {
 		out.NextCursor = eps[len(eps)-1].ID
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// enableEndpoint re-enables an endpoint, typically one the service disabled
+// after it kept failing. Its failure history is cleared, so it starts again
+// with a closed circuit. It is the same as PATCH {"status": "active"}.
+func (s *server) enableEndpoint(w http.ResponseWriter, r *http.Request) {
+	active := postgres.EndpointActive
+	ep, err := s.store.UpdateEndpoint(r.Context(), r.PathValue("app"), r.PathValue("ep"),
+		postgres.EndpointPatch{Status: &active})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	ep.Secret = ""
+	writeJSON(w, http.StatusOK, ep)
 }
 
 func (s *server) getEndpoint(w http.ResponseWriter, r *http.Request) {
@@ -222,12 +240,20 @@ func (s *server) rotateSecret(w http.ResponseWriter, r *http.Request) {
 }
 
 // replayEndpoint redelivers every dead delivery to the endpoint created at
-// or after "since", e.g. after the receiver's outage is fixed.
+// or after ?since=<RFC 3339 time>, e.g. after the receiver's outage is fixed.
+// A JSON body {"since": ...} is accepted too.
 func (s *server) replayEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Since *time.Time `json:"since"`
 	}
-	if !decode(w, r, &req) {
+	if v := r.URL.Query().Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			problem(w, http.StatusBadRequest, "since must be an RFC 3339 time such as 2026-10-11T00:00:00Z")
+			return
+		}
+		req.Since = &t
+	} else if r.ContentLength != 0 && !decode(w, r, &req) {
 		return
 	}
 	if req.Since == nil {
@@ -260,9 +286,8 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnprocessableEntity, "payload is required")
 		return
 	}
-	key := r.Header.Get("Idempotency-Key")
-	if len(key) > maxNameLen {
-		problem(w, http.StatusBadRequest, "Idempotency-Key must be at most 255 bytes")
+	key, ok := idempotencyKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -286,21 +311,47 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listDeliveries(w http.ResponseWriter, r *http.Request) {
-	ds, err := s.store.ListDeliveries(r.Context(), r.PathValue("app"), r.PathValue("msg"))
+	limit, ok := pageLimit(w, r)
+	if !ok {
+		return
+	}
+	ds, err := s.store.ListDeliveries(r.Context(), r.PathValue("app"), r.PathValue("msg"),
+		r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list[postgres.Delivery]{Data: ds})
+	out := list[postgres.Delivery]{Data: ds}
+	if len(ds) == limit {
+		out.NextCursor = ds[len(ds)-1].ID
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *server) listAttempts(w http.ResponseWriter, r *http.Request) {
-	as, err := s.store.ListAttempts(r.Context(), r.PathValue("app"), r.PathValue("del"))
+	limit, ok := pageLimit(w, r)
+	if !ok {
+		return
+	}
+	var after int64
+	if v := r.URL.Query().Get("cursor"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			problem(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
+		after = n
+	}
+	as, err := s.store.ListAttempts(r.Context(), r.PathValue("app"), r.PathValue("del"), after, limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list[postgres.Attempt]{Data: as})
+	out := list[postgres.Attempt]{Data: as}
+	if len(as) == limit {
+		out.NextCursor = strconv.FormatInt(as[len(as)-1].ID, 10)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // replayDelivery sends a dead or succeeded delivery again, with the same
@@ -312,6 +363,46 @@ func (s *server) replayDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, d)
+}
+
+// --- request helpers ---
+
+// pageLimit reads ?limit= (default 50, at most 100). It writes the problem
+// response itself and returns false when the value is invalid.
+func pageLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
+	v := r.URL.Query().Get("limit")
+	if v == "" {
+		return 50, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 100 {
+		problem(w, http.StatusBadRequest, "limit must be between 1 and 100")
+		return 0, false
+	}
+	return n, true
+}
+
+// idempotencyKey reads the optional Idempotency-Key header. It writes the
+// problem response itself and returns false when the key is too long.
+func idempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := r.Header.Get("Idempotency-Key")
+	if len(key) > maxNameLen {
+		problem(w, http.StatusBadRequest, "Idempotency-Key must be at most 255 bytes")
+		return "", false
+	}
+	return key, true
+}
+
+// writeCreated answers a create: 201 with the new object, or, when an
+// Idempotency-Key matched an earlier create, 200 with that object and an
+// Idempotent-Replayed header.
+func writeCreated(w http.ResponseWriter, duplicate bool, v any) {
+	if duplicate {
+		w.Header().Set("Idempotent-Replayed", "true")
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
+	writeJSON(w, http.StatusCreated, v)
 }
 
 // --- validation ---

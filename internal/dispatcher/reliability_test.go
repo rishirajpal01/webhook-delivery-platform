@@ -67,7 +67,7 @@ func TestRotatedSecretSignsWithBoth(t *testing.T) {
 	defer srv.Close()
 
 	r := f.send(t, srv.URL)
-	ds, _ := f.store.ListDeliveries(context.Background(), f.app.ID, r.Message.ID)
+	ds, _ := f.store.ListDeliveries(context.Background(), f.app.ID, r.Message.ID, "", 100)
 	if _, err := f.store.RotateSecret(context.Background(), f.app.ID, ds[0].EndpointID, newSecret, time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestShutdownFinishesSendsInProgress(t *testing.T) {
 
 func mustDelivery(t *testing.T, f fixture, msgID string) postgres.Delivery {
 	t.Helper()
-	ds, err := f.store.ListDeliveries(context.Background(), f.app.ID, msgID)
+	ds, err := f.store.ListDeliveries(context.Background(), f.app.ID, msgID, "", 100)
 	if err != nil || len(ds) != 1 {
 		t.Fatalf("deliveries = %+v, %v", ds, err)
 	}

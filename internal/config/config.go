@@ -2,6 +2,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"time"
@@ -22,8 +24,11 @@ type Config struct {
 	Role string
 	// ListenAddr is the address the HTTP API listens on.
 	ListenAddr string
-	// APIKey authenticates calls to /v1. Required when the role serves the API.
-	APIKey string
+	// APIKeyHash is the SHA-256 of the API key that authenticates calls to
+	// /v1, from API_KEY_SHA256 or by hashing API_KEY. Only the hash is kept,
+	// so the key itself never has to be stored. Required when the role
+	// serves the API.
+	APIKeyHash [32]byte
 	// ShutdownTimeout bounds how long in-flight requests get to finish on exit.
 	ShutdownTimeout time.Duration
 	// DispatcherConcurrency is how many deliveries one process sends at once.
@@ -53,7 +58,6 @@ func Load(getenv func(string) string) (Config, error) {
 		DatabaseURL:           getenv("DATABASE_URL"),
 		Role:                  getenv("ROLE"),
 		ListenAddr:            getenv("LISTEN_ADDR"),
-		APIKey:                getenv("API_KEY"),
 		ShutdownTimeout:       10 * time.Second,
 		DispatcherConcurrency: 16,
 		DispatcherLease:       30 * time.Second,
@@ -68,8 +72,12 @@ func Load(getenv func(string) string) (Config, error) {
 	if cfg.Role != RoleAPI && cfg.Role != RoleDispatcher && cfg.Role != RoleAll {
 		return Config{}, errors.New("ROLE must be api, dispatcher or all")
 	}
-	if cfg.RunsAPI() && len(cfg.APIKey) < 16 {
-		return Config{}, errors.New("API_KEY is required and must be at least 16 characters")
+	if cfg.RunsAPI() {
+		h, err := apiKeyHash(getenv("API_KEY"), getenv("API_KEY_SHA256"))
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.APIKeyHash = h
 	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8080"
@@ -110,4 +118,24 @@ func Load(getenv func(string) string) (Config, error) {
 		cfg.AttemptRetentionDays = n
 	}
 	return cfg, nil
+}
+
+// apiKeyHash returns the SHA-256 of the API key, given either the key or its
+// hash in hex (as printed by "printf %s KEY | sha256sum"), but not both.
+func apiKeyHash(key, hexHash string) ([32]byte, error) {
+	var h [32]byte
+	switch {
+	case key != "" && hexHash != "":
+		return h, errors.New("set API_KEY or API_KEY_SHA256, not both")
+	case hexHash != "":
+		b, err := hex.DecodeString(hexHash)
+		if err != nil || len(b) != len(h) {
+			return h, errors.New("API_KEY_SHA256 must be 64 hex characters")
+		}
+		copy(h[:], b)
+		return h, nil
+	case len(key) < 16:
+		return h, errors.New("API_KEY (at least 16 characters) or API_KEY_SHA256 is required")
+	}
+	return sha256.Sum256([]byte(key)), nil
 }

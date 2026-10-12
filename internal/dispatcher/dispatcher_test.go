@@ -79,7 +79,7 @@ func (f fixture) waitForState(t *testing.T, msgID, state string) postgres.Delive
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		ds, err := f.store.ListDeliveries(context.Background(), f.app.ID, msgID)
+		ds, err := f.store.ListDeliveries(context.Background(), f.app.ID, msgID, "", 100)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -94,7 +94,7 @@ func (f fixture) waitForState(t *testing.T, msgID, state string) postgres.Delive
 
 func (f fixture) attempts(t *testing.T, deliveryID string) []postgres.Attempt {
 	t.Helper()
-	as, err := f.store.ListAttempts(context.Background(), f.app.ID, deliveryID)
+	as, err := f.store.ListAttempts(context.Background(), f.app.ID, deliveryID, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestFailureIsRetriedLater(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	var d postgres.Delivery
 	for time.Now().Before(deadline) {
-		ds, _ := f.store.ListDeliveries(context.Background(), f.app.ID, r.Message.ID)
+		ds, _ := f.store.ListDeliveries(context.Background(), f.app.ID, r.Message.ID, "", 100)
 		if d = ds[0]; d.AttemptCount == 1 {
 			break
 		}

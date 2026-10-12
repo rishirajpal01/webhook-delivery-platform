@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -43,7 +44,7 @@ func TestHealthRoutes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := NewHandler(fakePinger{tt.dbErr}, nil, testKey, discard)
+			h := NewHandler(fakePinger{tt.dbErr}, nil, sha256.Sum256([]byte(testKey)), discard)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(tt.method, tt.path, nil))
 			if rec.Code != tt.want {
@@ -65,7 +66,7 @@ func newClient(t *testing.T) client {
 	if _, err := postgres.Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	return client{t: t, h: NewHandler(db, postgres.NewStore(db), testKey, discard), db: db}
+	return client{t: t, h: NewHandler(db, postgres.NewStore(db), sha256.Sum256([]byte(testKey)), discard), db: db}
 }
 
 // do sends a request and decodes the JSON response into out (if non-nil).
@@ -163,6 +164,52 @@ func TestSendFlow(t *testing.T) {
 	c.expect(c.do("GET", base+"/endpoints/"+ep.ID, "", nil), http.StatusNotFound)
 }
 
+func TestIdempotentCreatesAndPages(t *testing.T) {
+	c := newClient(t)
+
+	var app, again postgres.App
+	c.expect(c.do("POST", "/v1/apps", `{"name":"acme"}`, &app, "Idempotency-Key", "k1"), http.StatusCreated)
+	rec := c.do("POST", "/v1/apps", `{"name":"acme"}`, &again, "Idempotency-Key", "k1")
+	c.expect(rec, http.StatusOK)
+	if again.ID != app.ID || rec.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("repeat app create = %+v (replayed=%q), want %s", again, rec.Header().Get("Idempotent-Replayed"), app.ID)
+	}
+	base := "/v1/apps/" + app.ID
+
+	var ep, epAgain postgres.Endpoint
+	body := `{"url":"https://example.com/hook"}`
+	c.expect(c.do("POST", base+"/endpoints", body, &ep, "Idempotency-Key", "k1"), http.StatusCreated)
+	c.expect(c.do("POST", base+"/endpoints", body, &epAgain, "Idempotency-Key", "k1"), http.StatusOK)
+	if epAgain.ID != ep.ID || epAgain.Secret != ep.Secret {
+		t.Fatalf("repeat endpoint create = %+v, want %+v", epAgain, ep)
+	}
+	for range 2 {
+		c.expect(c.do("POST", base+"/endpoints", body, nil), http.StatusCreated)
+	}
+
+	// Three deliveries, read two at a time.
+	var sent struct{ ID string }
+	c.expect(c.do("POST", base+"/messages", `{"event_type":"a","payload":{}}`, &sent), http.StatusAccepted)
+	var p1, p2 list[postgres.Delivery]
+	c.expect(c.do("GET", base+"/messages/"+sent.ID+"/deliveries?limit=2", "", &p1), http.StatusOK)
+	c.expect(c.do("GET", base+"/messages/"+sent.ID+"/deliveries?limit=2&cursor="+p1.NextCursor, "", &p2), http.StatusOK)
+	if len(p1.Data) != 2 || p1.NextCursor == "" || len(p2.Data) != 1 || p2.NextCursor != "" || p2.Data[0].ID <= p1.NextCursor {
+		t.Fatalf("delivery pages = %+v / %+v", p1, p2)
+	}
+
+	// Attempts page the same way.
+	del := p2.Data[0].ID
+	if _, err := c.db.Exec(`INSERT INTO attempts (delivery_id, latency_ms) SELECT $1, 1 FROM generate_series(1, 3)`, del); err != nil {
+		t.Fatal(err)
+	}
+	var a1, a2 list[postgres.Attempt]
+	c.expect(c.do("GET", base+"/deliveries/"+del+"/attempts?limit=2", "", &a1), http.StatusOK)
+	c.expect(c.do("GET", base+"/deliveries/"+del+"/attempts?limit=2&cursor="+a1.NextCursor, "", &a2), http.StatusOK)
+	if len(a1.Data) != 2 || len(a2.Data) != 1 || a2.NextCursor != "" || a2.Data[0].ID <= a1.Data[1].ID {
+		t.Fatalf("attempt pages = %+v / %+v", a1, a2)
+	}
+}
+
 func TestValidationAndNotFound(t *testing.T) {
 	c := newClient(t)
 	var app postgres.App
@@ -203,6 +250,10 @@ func TestValidationAndNotFound(t *testing.T) {
 		{"replay missing endpoint", "POST", base + "/endpoints/ep_x/replay", `{"since":"2026-01-01T00:00:00Z"}`, 404},
 		{"rotate with bad secret", "POST", base + "/endpoints/ep_x/secret/rotate", `{"secret":"hunter2"}`, 422},
 		{"rotate missing endpoint", "POST", base + "/endpoints/ep_x/secret/rotate", "", 404},
+		{"enable missing endpoint", "POST", base + "/endpoints/ep_x/enable", "", 404},
+		{"replay endpoint with bad since param", "POST", base + "/endpoints/ep_x/replay?since=yesterday", "", 400},
+		{"bad deliveries limit", "GET", base + "/messages/msg_x/deliveries?limit=0", "", 400},
+		{"bad attempts cursor", "GET", base + "/deliveries/del_x/attempts?cursor=abc", "", 400},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -260,9 +311,27 @@ func TestReplayAndRotate(t *testing.T) {
 		t.Fatal(err)
 	}
 	var replayed struct{ Replayed int }
-	c.expect(c.do("POST", base+"/endpoints/"+ep.ID+"/replay", `{"since":"2000-01-01T00:00:00Z"}`, &replayed), http.StatusAccepted)
+	c.expect(c.do("POST", base+"/endpoints/"+ep.ID+"/replay?since=2000-01-01T00:00:00Z", "", &replayed), http.StatusAccepted)
 	if replayed.Replayed != 1 {
 		t.Fatalf("replayed = %d, want 1", replayed.Replayed)
+	}
+	// The JSON body form is accepted too.
+	if _, err := c.db.Exec(`UPDATE deliveries SET state = 'dead'`); err != nil {
+		t.Fatal(err)
+	}
+	c.expect(c.do("POST", base+"/endpoints/"+ep.ID+"/replay", `{"since":"2000-01-01T00:00:00Z"}`, &replayed), http.StatusAccepted)
+	if replayed.Replayed != 1 {
+		t.Fatalf("replayed with a body = %d, want 1", replayed.Replayed)
+	}
+
+	// enable re-enables an endpoint the service disabled.
+	if _, err := c.db.Exec(`UPDATE endpoints SET status = 'disabled', disabled_at = now(), consecutive_failures = 50`); err != nil {
+		t.Fatal(err)
+	}
+	var enabled postgres.Endpoint
+	c.expect(c.do("POST", base+"/endpoints/"+ep.ID+"/enable", "", &enabled), http.StatusOK)
+	if enabled.Status != "active" || enabled.DisabledAt != nil || enabled.ConsecutiveFailures != 0 || enabled.Secret != "" {
+		t.Fatalf("enabled endpoint = %+v", enabled)
 	}
 
 	var rotated postgres.Endpoint

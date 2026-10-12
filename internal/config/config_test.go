@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -18,6 +20,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.Role != RoleAll || !cfg.RunsAPI() || !cfg.RunsDispatcher() {
 		t.Errorf("Role = %q, want all", cfg.Role)
+	}
+	if cfg.APIKeyHash != sha256.Sum256([]byte(key)) {
+		t.Error("APIKeyHash is not the SHA-256 of API_KEY")
 	}
 	if cfg.ListenAddr != ":8080" || cfg.ShutdownTimeout != 10*time.Second ||
 		cfg.DispatcherConcurrency != 16 || cfg.DispatcherLease != 30*time.Second || cfg.AllowPrivateNetworks ||
@@ -47,6 +52,17 @@ func TestLoadOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadAPIKeyHash(t *testing.T) {
+	sum := sha256.Sum256([]byte(key))
+	cfg, err := Load(env(map[string]string{"DATABASE_URL": "postgres://x", "API_KEY_SHA256": hex.EncodeToString(sum[:])}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKeyHash != sum {
+		t.Error("APIKeyHash does not match API_KEY_SHA256")
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	ok := map[string]string{"DATABASE_URL": "postgres://x", "API_KEY": key}
 	with := func(k, v string) map[string]string {
@@ -61,6 +77,8 @@ func TestLoadErrors(t *testing.T) {
 		"missing database url": with("DATABASE_URL", ""),
 		"missing api key":      with("API_KEY", ""),
 		"short api key":        with("API_KEY", "short"),
+		"key and hash":         with("API_KEY_SHA256", "00"),
+		"bad hash":             map[string]string{"DATABASE_URL": "postgres://x", "API_KEY_SHA256": "xyz"},
 		"bad role":             with("ROLE", "worker"),
 		"bad timeout":          with("SHUTDOWN_TIMEOUT", "soon"),
 		"negative timeout":     with("SHUTDOWN_TIMEOUT", "-1s"),

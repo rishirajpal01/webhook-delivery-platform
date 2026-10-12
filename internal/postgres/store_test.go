@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -121,7 +122,7 @@ func TestCreateMessageFansOutToMatchingActiveEndpoints(t *testing.T) {
 	if r.Deliveries != 2 || r.Duplicate {
 		t.Fatalf("send = %+v, want 2 deliveries", r)
 	}
-	ds, err := s.ListDeliveries(ctx, app.ID, r.Message.ID)
+	ds, err := s.ListDeliveries(ctx, app.ID, r.Message.ID, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,11 +222,11 @@ func TestClaimLeasesDueDeliveriesOnce(t *testing.T) {
 	if again, _ := s.Claim(ctx, 10, time.Minute); len(again) != 0 {
 		t.Fatal("claimed a delivery that is not due")
 	}
-	ds, _ := s.ListDeliveries(ctx, app.ID, r.Message.ID)
+	ds, _ := s.ListDeliveries(ctx, app.ID, r.Message.ID, "", 100)
 	if ds[0].State != DeliveryPending || ds[0].AttemptCount != 1 {
 		t.Fatalf("after retry: %+v", ds[0])
 	}
-	as, err := s.ListAttempts(ctx, app.ID, j.DeliveryID)
+	as, err := s.ListAttempts(ctx, app.ID, j.DeliveryID, 0, 100)
 	if err != nil || len(as) != 1 || as[0].Error != "boom" || as[0].StatusCode != nil {
 		t.Fatalf("attempts = %+v, %v", as, err)
 	}
@@ -275,7 +276,7 @@ func TestExpiredLeaseIsReleasedAndStaleCompletionIgnored(t *testing.T) {
 	if err != nil || res.Applied {
 		t.Fatalf("stale Complete = %+v, %v; want no state change", res, err)
 	}
-	ds, _ := s.ListDeliveries(ctx, app.ID, r.Message.ID)
+	ds, _ := s.ListDeliveries(ctx, app.ID, r.Message.ID, "", 100)
 	if ds[0].State != DeliveryInFlight {
 		t.Fatalf("state = %s, want in_flight", ds[0].State)
 	}
@@ -286,7 +287,7 @@ func TestExpiredLeaseIsReleasedAndStaleCompletionIgnored(t *testing.T) {
 	if err != nil || !res.Applied {
 		t.Fatalf("fresh Complete = %+v, %v", res, err)
 	}
-	as, _ := s.ListAttempts(ctx, app.ID, fresh[0].DeliveryID)
+	as, _ := s.ListAttempts(ctx, app.ID, fresh[0].DeliveryID, 0, 100)
 	if len(as) != 2 {
 		t.Fatalf("attempts = %d, want 2 (both calls happened)", len(as))
 	}
@@ -341,5 +342,88 @@ func TestConcurrentClaimersNeverShareADelivery(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("delivery %s claimed %d times", id, n)
 		}
+	}
+}
+
+func TestIdempotentCreates(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	a1, dup, err := s.CreateAppIdempotent(ctx, "acme", "app-key")
+	if err != nil || dup {
+		t.Fatalf("first app create: dup %v, err %v", dup, err)
+	}
+	a2, dup, err := s.CreateAppIdempotent(ctx, "acme", "app-key")
+	if err != nil || !dup || a2.ID != a1.ID {
+		t.Fatalf("repeat app create = %+v, dup %v, err %v; want the first app", a2, dup, err)
+	}
+
+	ep := Endpoint{AppID: a1.ID, URL: "https://example.com/hook", Secret: "whsec_dGVzdHRlc3R0ZXN0dGVzdA=="}
+	e1, dup, err := s.CreateEndpointIdempotent(ctx, ep, "ep-key")
+	if err != nil || dup {
+		t.Fatalf("first endpoint create: dup %v, err %v", dup, err)
+	}
+	e2, dup, err := s.CreateEndpointIdempotent(ctx, ep, "ep-key")
+	if err != nil || !dup || e2.ID != e1.ID || e2.Secret != ep.Secret {
+		t.Fatalf("repeat endpoint create = %+v, dup %v, err %v; want the first endpoint with its secret", e2, dup, err)
+	}
+	if eps, _ := s.ListEndpoints(ctx, a1.ID, "", 10); len(eps) != 1 {
+		t.Fatalf("%d endpoints, want 1", len(eps))
+	}
+	// Keys are per app, and a missing app is still not found.
+	other := mustApp(t, s)
+	ep.AppID = other.ID
+	if _, dup, err := s.CreateEndpointIdempotent(ctx, ep, "ep-key"); err != nil || dup {
+		t.Fatalf("same key in another app: dup %v, err %v", dup, err)
+	}
+	ep.AppID = "app_missing"
+	if _, _, err := s.CreateEndpointIdempotent(ctx, ep, "ep-key"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing app: err %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeliveryAndAttemptPages(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	app := mustApp(t, s)
+	for range 5 {
+		mustEndpoint(t, s, app.ID)
+	}
+	r := mustSend(t, s, app.ID, "a")
+
+	var seen []string
+	cursor := ""
+	for {
+		page, err := s.ListDeliveries(ctx, app.ID, r.Message.ID, cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range page {
+			seen = append(seen, d.ID)
+		}
+		if len(page) < 2 {
+			break
+		}
+		cursor = page[len(page)-1].ID
+	}
+	if len(seen) != 5 || !slices.IsSorted(seen) {
+		t.Fatalf("paged deliveries = %v; want 5 in id order", seen)
+	}
+
+	// Each Complete logs an attempt, even once the lease is gone.
+	jobs, _ := s.Claim(ctx, 1, time.Minute)
+	j := jobs[0]
+	for range 3 {
+		if _, err := s.Complete(ctx, j, Outcome{
+			Attempt:   Attempt{AttemptedAt: time.Now(), LatencyMS: 1, Error: "boom"},
+			NextState: DeliveryPending, RetryAt: time.Now(),
+		}, HealthPolicy{FailureThreshold: 100, CooldownBase: time.Minute, CooldownMax: time.Hour, DisableAfter: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, _ := s.ListAttempts(ctx, app.ID, j.DeliveryID, 0, 2)
+	rest, _ := s.ListAttempts(ctx, app.ID, j.DeliveryID, first[1].ID, 2)
+	if len(first) != 2 || len(rest) != 1 || rest[0].ID <= first[1].ID {
+		t.Fatalf("attempt pages = %+v / %+v", first, rest)
 	}
 }

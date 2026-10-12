@@ -57,7 +57,7 @@ func run(logger *slog.Logger) error {
 	// Every role serves health checks and metrics; only the api role serves /v1.
 	handler := api.NewOpsHandler(db, logger)
 	if cfg.RunsAPI() {
-		handler = api.NewHandler(db, store, cfg.APIKey, logger)
+		handler = api.NewHandler(db, store, cfg.APIKeyHash, logger)
 	}
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	running++
