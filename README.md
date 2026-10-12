@@ -7,12 +7,12 @@ and recording every attempt.
 
 One Go binary plus Postgres. No Kafka, Redis or Kubernetes required.
 
-> **Status: phase 4 (developer experience).** Everything in the design doc
+> **Status: v1.0.** Everything in the design doc
 > works: sending, fan-out, retries, signing, the attempt log, the SSRF guard,
 > replay, circuit breaking, secret rotation, per-endpoint concurrency and rate
 > limits across any number of dispatchers, a partitioned attempt log, an
-> OpenAPI spec, a Go SDK with `VerifyRequest` for receivers, and a CLI. The
-> v1.0 launch is phase 5.
+> OpenAPI spec, a Go SDK with `VerifyRequest` for receivers, and a CLI. How it
+> works and why: [docs/writeup.md](docs/writeup.md).
 
 ## Guarantees
 
@@ -23,7 +23,7 @@ One Go binary plus Postgres. No Kafka, Redis or Kubernetes required.
   `FOR UPDATE SKIP LOCKED` and a 30 s lease; if one dies mid-send, the lease
   expires and another dispatcher sends again. `TestCrashLosesNothing` checks
   this by `kill -9`-ing the dispatcher repeatedly (100 000 messages, 8 kills:
-  none lost, 21 duplicates).
+  none lost, 38 duplicates).
 
 ## Quickstart
 
@@ -64,6 +64,7 @@ stops everything. To receive webhooks in your own code, see
 | [docs/sdk-and-cli.md](docs/sdk-and-cli.md) | The Go SDK and `webhookctl` |
 | [docs/delivery.md](docs/delivery.md) | How delivery works: fairness, retries, circuit breaker, replay, rotation |
 | [docs/operations.md](docs/operations.md) | Running it: configuration, scaling, retention, metrics |
+| [docs/writeup.md](docs/writeup.md) | The design, and why: queue, fairness, failure handling, measurements |
 
 ## Benchmarks
 
@@ -78,9 +79,9 @@ CPU. Every run delivered every message, with no duplicates.
 
 | Dispatchers | Burst throughput (60 000 deliveries) | Steady lag at 400 deliveries/s, p50 / p99 |
 | --- | --- | --- |
-| 1 | 576 deliveries/s | 21 ms / 195 ms |
-| 2 | 1 045 deliveries/s | 57 ms / 253 ms |
-| 4 | 1 458 deliveries/s | 72 ms / 247 ms |
+| 1 | 540 deliveries/s | 24 ms / 155 ms |
+| 2 | 956 deliveries/s | 78 ms / 256 ms |
+| 4 | 1 437 deliveries/s | 76 ms / 240 ms |
 
 Steady lag is mostly the 250 ms poll interval: an idle dispatcher checks
 for new work four times a second.
@@ -133,7 +134,7 @@ scripts/bench.sh     benchmark with 1, 2 and 4 dispatcher replicas
 | 2 · Reliability ✓ | Replay, circuit breaker and auto-disable, `Retry-After`, secret rotation, graceful drain |
 | 3 · Fairness and scale ✓ | Per-endpoint concurrency and rate limits, multiple dispatchers, partitioned attempts, load generator |
 | 4 · Developer experience ✓ | OpenAPI spec, Go SDK, `VerifyRequest()` for receivers, CLI, docs |
-| 5 · Launch | Benchmarks in this README, write-up, v1.0 |
+| 5 · Launch ✓ | Benchmarks in this README, write-up, v1.0 |
 
 ## License
 

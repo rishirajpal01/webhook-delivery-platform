@@ -14,8 +14,8 @@ set -euo pipefail
 ADMIN_URL=${ADMIN_URL:-postgres://postgres@localhost:5432/postgres?sslmode=disable}
 DB=webhookd_bench
 DB_URL=${ADMIN_URL/\/postgres\?/\/$DB?}
-MESSAGES=${MESSAGES:-10000}  # burst size
-STEADY=${STEADY:-3000}       # messages in the steady run
+MESSAGES=${MESSAGES:-3000}   # burst size (x ENDPOINTS deliveries)
+STEADY=${STEADY:-1000}       # messages in the steady run
 RATE=${RATE:-20}             # steady send rate, messages/s
 ENDPOINTS=${ENDPOINTS:-20}   # each message fans out to every endpoint
 LATENCY=${LATENCY:-20ms}     # receiver response time
