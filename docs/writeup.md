@@ -138,16 +138,17 @@ the request arriving.
 
 | Dispatchers | Burst throughput (60 000 deliveries) | Steady lag at 400 deliveries/s, p50 / p99 |
 | --- | --- | --- |
-| 1 | 540 deliveries/s | 24 ms / 155 ms |
-| 2 | 956 deliveries/s | 78 ms / 256 ms |
-| 4 | 1 437 deliveries/s | 76 ms / 240 ms |
+| 1 | 560 deliveries/s | 9 ms / 45 ms |
+| 2 | 1 056 deliveries/s | 8 ms / 21 ms |
+| 4 | 1 584 deliveries/s | 8 ms / 24 ms |
 
 Every run delivered every message with no duplicates. `scripts/bench.sh`
 reproduces the table.
 
-Two honest caveats. Steady-state lag is mostly the 250 ms poll interval: an
-idle dispatcher looks for work four times a second. `LISTEN/NOTIFY` would
-cut it, at the price of a connection per dispatcher. And 2 to 4 replicas
+New messages wake dispatchers through `LISTEN/NOTIFY`, at the price of one
+held connection per dispatcher. Before that, an idle dispatcher polled four
+times a second and the poll was most of the lag: p99 was 155 to 256 ms on the
+same setup. One honest caveat: 2 to 4 replicas
 gains less than 1 to 2 because the whole stack shares 4 CPUs. On separate
 machines, the ceiling is Postgres's write rate: each delivery costs about
 three row writes (claim, attempt, completion).
@@ -163,7 +164,6 @@ on every push, so the README cannot go stale.
 
 ## What I would do next
 
-- `LISTEN/NOTIFY` to wake dispatchers, for sub-50 ms idle lag.
 - Opt-in FIFO per endpoint, for receivers that need order.
 - Benchmarks with Postgres on its own machine, to find the real ceiling.
 

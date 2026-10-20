@@ -73,6 +73,7 @@ webhookctl [-api URL] [-key KEY] [-o TEMPLATE] COMMAND ARGS [FLAGS]
   endpoints rotate-secret APP EP [-secret whsec_…]
   endpoints replay APP EP -since TIME   (RFC 3339, or a duration such as 2h meaning that long ago)
   send APP EVENT_TYPE PAYLOAD_JSON [-idempotency-key K]
+  messages APP [-limit N] [-cursor C]   (newest first)
   deliveries APP MSG [-limit N] [-cursor C] [-wait DURATION]
   attempts APP DEL [-limit N] [-cursor C]
   replay APP DEL

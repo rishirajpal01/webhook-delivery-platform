@@ -2,6 +2,9 @@ module github.com/rishirajpal01/webhook-delivery-platform
 
 go 1.25.0
 
+// Go 1.25 no longer gets security fixes; build with a supported release.
+toolchain go1.26.10
+
 require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.23.2

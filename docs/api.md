@@ -9,9 +9,12 @@ All `/v1` routes need `Authorization: Bearer $API_KEY`. Errors are
 [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json`.
 Every create (apps, endpoints, messages) honours an `Idempotency-Key` header:
 a repeat with the same key returns the first object with `200` and
-`Idempotent-Replayed: true` instead of creating another. Lists take
-`?limit=` (1 to 100, default 50) and `?cursor=`, and return `next_cursor`
-while more remain.
+`Idempotent-Replayed: true` instead of creating another. Reusing a key with
+a different request (another payload, name or URL) is refused with `422`.
+A message's key is remembered for as long as the message is kept
+(`MESSAGE_RETENTION_DAYS`).
+Lists take `?limit=` (1 to 100, default 50) and `?cursor=`, and return
+`next_cursor` while more remain.
 
 | Method and path | Purpose |
 | --- | --- |
@@ -19,11 +22,12 @@ while more remain.
 | `GET /v1/apps/{app}` | Read an application |
 | `POST /v1/apps/{app}/endpoints` | Create an endpoint `{"url", "event_types"?, "secret"?, "max_in_flight"?, "rate_limit"?}`; returns the signing secret once |
 | `GET /v1/apps/{app}/endpoints` | List endpoints |
-| `GET`, `PATCH`, `DELETE /v1/apps/{app}/endpoints/{ep}` | Read, change (`url`, `event_types`, `status`: active or paused, `max_in_flight`, `rate_limit`) or delete an endpoint. Setting `active` also re-enables a disabled endpoint and clears its failure history |
-| `POST /v1/apps/{app}/endpoints/{ep}/secret/rotate` | New signing secret `{"secret"?}`, returned once; the old one keeps signing for 24 h |
+| `GET`, `PATCH`, `DELETE /v1/apps/{app}/endpoints/{ep}` | Read, change (`url`, `event_types`, `status`: active or paused, `max_in_flight`, `rate_limit`) or delete an endpoint. A paused endpoint keeps queueing events and receives them when set back to `active`. Setting `active` also re-enables a disabled endpoint and clears its failure history |
+| `POST /v1/apps/{app}/endpoints/{ep}/secret/rotate` | New signing secret `{"secret"?}`, returned once; the old one keeps signing for 24 h (`SECRET_ROTATION_OVERLAP`) |
 | `POST /v1/apps/{app}/endpoints/{ep}/enable` | Re-enable a disabled endpoint and clear its failure history (same as `PATCH` with `"status": "active"`) |
 | `POST /v1/apps/{app}/endpoints/{ep}/replay?since=<RFC 3339>` | Redeliver every `dead` delivery created since then (a `{"since"}` body works too); returns `{"replayed": n}` |
 | `POST /v1/apps/{app}/messages` | Send an event `{"event_type", "payload"}` |
+| `GET /v1/apps/{app}/messages` | An app's messages, newest first |
 | `GET /v1/apps/{app}/messages/{msg}/deliveries` | Where a message went and the state of each delivery |
 | `GET /v1/apps/{app}/deliveries/{del}/attempts` | Every attempt: status, latency, error, first 4 KB of the response |
 | `POST /v1/apps/{app}/deliveries/{del}/replay` | Send a `dead` or `succeeded` delivery again (409 while it is still pending) |

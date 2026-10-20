@@ -1,6 +1,10 @@
 # Local stack: Postgres, the service, and a mock receiver to send webhooks to.
 #   docker compose up --build
 #   then follow the README quickstart (scripts/quickstart.sh runs it)
+#
+# FOR YOUR OWN MACHINE ONLY. It turns the SSRF guard off and uses a known API
+# key and database password, so every port is bound to localhost. To run it
+# for real, see "Running in production" in docs/operations.md.
 services:
   postgres:
     image: postgres:16-alpine
@@ -9,7 +13,7 @@ services:
       POSTGRES_PASSWORD: webhooks
       POSTGRES_DB: webhooks
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -28,7 +32,7 @@ services:
       # guard has to be off locally. Never set this in production.
       ALLOW_PRIVATE_NETWORKS: "true"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     # Healthy once migrations ran and /readyz answers, so
     # "docker compose up --wait" returns only when the API is usable.
     healthcheck:
@@ -40,6 +44,8 @@ services:
       postgres:
         condition: service_healthy
     restart: on-failure
+    # Time to finish and record in-flight sends on shutdown (docs/operations.md).
+    stop_grace_period: 30s
 
   # Extra dispatcher replicas, off by default:
   #   docker compose --profile scale up --build --scale dispatcher=3
@@ -54,6 +60,7 @@ services:
       postgres:
         condition: service_healthy
     restart: on-failure
+    stop_grace_period: 30s
 
   mockreceiver:
     build: .
@@ -65,7 +72,7 @@ services:
       - -fail-rate=${MOCK_FAIL_RATE:-0.3}
       - -secret=whsec_ZGVtby1zZWNyZXQtZm9yLWxvY2FsLWRldi1vbmx5ISE=
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
 
 volumes:
   pgdata:

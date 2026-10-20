@@ -74,11 +74,11 @@ sequenceDiagram
 
 Key guarantees in `Store.CreateMessage`:
 - **Atomic fanout**: Message insertion and delivery generation occur inside single transaction. Crash cannot produce orphaned message without delivery records.
-- **Idempotency**: Scoped to `(app_id, idempotency_key)`. Re-submitting returns previous message without re-enqueueing.
+- **Idempotency**: Scoped to `(app_id, idempotency_key)`. Re-submitting returns previous message without re-enqueueing. Reusing a key with a different event type or payload returns `422`.
 
 ## Fair Queue Engine & Worker Claim
 
-Dispatchers poll Postgres without message broker. Dispatcher handles rate limits, concurrency limits, and circuit breakers directly in SQL claim query.
+Dispatchers claim work straight from Postgres, no message broker. New messages and replays wake them through `LISTEN/NOTIFY`; a 250 ms poll catches retries coming due. Dispatcher handles rate limits, concurrency limits, and circuit breakers directly in SQL claim query.
 
 ```mermaid
 flowchart TD
@@ -138,7 +138,7 @@ Headers sent:
 - `webhook-timestamp`: Unix timestamp string.
 - `webhook-signature`: `v1,<base64 HMAC-SHA256 of id.timestamp.body>`.
 
-**Zero-downtime secret rotation**: Old secret stays active for configured window (default 24 hours). Dispatcher signs with both secrets; headers hold space-separated signatures ([`internal/dispatcher/dispatcher.go#L368-L376`](../../internal/dispatcher/dispatcher.go#L368-L376)).
+**Zero-downtime secret rotation**: Old secret stays active for configured window (default 24 hours). Dispatcher signs with both secrets; headers hold space-separated signatures ([`internal/dispatcher/dispatcher.go#L422-L430`](../../internal/dispatcher/dispatcher.go#L422-L430)).
 
 ### SSRF Protection ([`internal/ssrf/ssrf.go`](../../internal/ssrf/ssrf.go))
 
@@ -172,7 +172,7 @@ stateDiagram-v2
 - Jitter: ±25% around base duration.
 - Respects `Retry-After` header on HTTP 429 and 503 responses, capped at 24 hours.
 
-### 2. Circuit Breaker ([`internal/postgres/queue.go#L320-L352`](../../internal/postgres/queue.go#L320-L352))
+### 2. Circuit Breaker ([`internal/postgres/queue.go#L325-L357`](../../internal/postgres/queue.go#L325-L357))
 - Trips after 10 consecutive delivery failures.
 - Normal claims pause for that endpoint.
 - Initial cool-down: 1 minute.
@@ -181,7 +181,7 @@ stateDiagram-v2
 
 ### 3. Auto-Disable
 - 5 days continuous failures automatically changes endpoint status to `disabled`.
-- Atomically dispatches `endpoint.disabled` system event to notify operator.
+- Atomically dispatches `endpoint.disabled` system event to the app's endpoints subscribed to it (subscribe one, or alert on `webhookd_endpoints_disabled_total`).
 - `POST /v1/apps/{app}/endpoints/{ep}/enable` restores endpoint to active and resets counters.
 
 ### 4. Replay
@@ -195,6 +195,8 @@ Attempt table records every HTTP interaction and error response body. It grows r
 - Hourly maintenance task (`Store.MaintainAttemptPartitions`) pre-creates upcoming 7 days of partitions.
 - Partitions older than retention days (configured via `ATTEMPT_RETENTION_DAYS`) dropped instantly via `DROP TABLE`.
 - Avoids bloat and heavy table-locking `DELETE` queries.
+
+Messages and their deliveries are kept for `MESSAGE_RETENTION_DAYS` (30) once every delivery has finished, then deleted in small batches by the same hourly task. Unfinished messages are never deleted.
 
 ## SDK & Developer Tools
 

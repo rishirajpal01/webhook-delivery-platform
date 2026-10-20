@@ -92,11 +92,11 @@ sequenceDiagram
 
 Key guarantees in `Store.CreateMessage`:
 - **Atomic fanout**: Message insertion and delivery generation occur inside single transaction. Crash cannot produce orphaned message without delivery records.
-- **Idempotency**: Scoped to `(app_id, idempotency_key)`. Re-submitting returns previous message without re-enqueueing.
+- **Idempotency**: Scoped to `(app_id, idempotency_key)`. Re-submitting returns previous message without re-enqueueing. Reusing a key with a different event type or payload returns `422`.
 
 ### Fair Queue Engine & Worker Claim
 
-Dispatchers poll Postgres without message broker. Dispatcher handles rate limits, concurrency limits, and circuit breakers directly in SQL claim query.
+Dispatchers claim work straight from Postgres, no message broker. New messages and replays wake them through `LISTEN/NOTIFY`; a 250 ms poll catches retries coming due. Dispatcher handles rate limits, concurrency limits, and circuit breakers directly in SQL claim query.
 
 ```mermaid
 flowchart TD
@@ -155,7 +155,7 @@ Headers sent:
 - `webhook-timestamp`: Unix timestamp string.
 - `webhook-signature`: `v1,<base64 HMAC-SHA256 of id.timestamp.body>`.
 
-**Zero-downtime secret rotation**: Old secret stays active for configured window (default 24 hours). Dispatcher signs with both secrets; headers hold space-separated signatures ([`internal/dispatcher/dispatcher.go#L368-L376`](internal/dispatcher/dispatcher.go#L368-L376)).
+**Zero-downtime secret rotation**: Old secret stays active for configured window (default 24 hours). Dispatcher signs with both secrets; headers hold space-separated signatures ([`internal/dispatcher/dispatcher.go#L422-L430`](internal/dispatcher/dispatcher.go#L422-L430)).
 
 #### SSRF Protection ([`internal/ssrf/ssrf.go`](internal/ssrf/ssrf.go))
 - Injected via custom `net.Dialer.Control`.
@@ -183,9 +183,9 @@ stateDiagram-v2
     Open --> Disabled : Failing continuously for 5 days
 ```
 
-1. **Retry Schedule ([`internal/dispatcher/schedule.go`](internal/dispatcher/schedule.go))**: 10 attempts over 23 hours: 5s, 30s, 2m, 10m, 30m, 1h, 3h, 6h, 12h. Jitter: ±25% around base duration. Respects `Retry-After` header on HTTP 429 and 503 responses, capped at 24 hours.
-2. **Circuit Breaker ([`internal/postgres/queue.go#L320-L352`](internal/postgres/queue.go#L320-L352))**: Trips after 10 consecutive delivery failures. Normal claims pause for that endpoint. Initial cool-down: 1 minute. Once cool-down expires, `Store.ClaimProbes` claims single probe delivery. Success closes circuit and resets failure counter. Failure doubles cool-down (capped at 1 hour).
-3. **Auto-Disable**: 5 days continuous failures automatically changes endpoint status to `disabled`. Atomically dispatches `endpoint.disabled` system event to notify operator. `POST /v1/apps/{app}/endpoints/{ep}/enable` restores endpoint to active and resets counters.
+1. **Retry Schedule ([`internal/dispatcher/schedule.go`](internal/dispatcher/schedule.go))**: 10 attempts over 23 hours: 5s, 30s, 2m, 10m, 30m, 1h, 3h, 6h, 12h. Jitter: ±25% around base duration. Both configurable (`RETRY_SCHEDULE`, `RETRY_JITTER`). Respects `Retry-After` header on HTTP 429 and 503 responses, capped at 24 hours.
+2. **Circuit Breaker ([`internal/postgres/queue.go#L325-L357`](internal/postgres/queue.go#L325-L357))**: Trips after 10 consecutive delivery failures. Normal claims pause for that endpoint. Initial cool-down: 1 minute. Once cool-down expires, `Store.ClaimProbes` claims single probe delivery. Success closes circuit and resets failure counter. Failure doubles cool-down (capped at 1 hour).
+3. **Auto-Disable**: 5 days continuous failures automatically changes endpoint status to `disabled`. Atomically dispatches `endpoint.disabled` system event to the app's endpoints subscribed to it (subscribe one, or alert on `webhookd_endpoints_disabled_total`). `POST /v1/apps/{app}/endpoints/{ep}/enable` restores endpoint to active and resets counters.
 4. **Replay**: Endpoints and deliveries support manual replay via API (`POST .../replay`). Delivery reset to pending with fresh retry schedule, preserving original `webhook-id` so receivers avoid duplicate actions.
 
 ### Day-Partitioned Attempt Storage
@@ -195,6 +195,8 @@ Attempt table records every HTTP interaction and error response body. It grows r
 - Hourly maintenance task (`Store.MaintainAttemptPartitions`) pre-creates upcoming 7 days of partitions.
 - Partitions older than retention days (configured via `ATTEMPT_RETENTION_DAYS`) dropped instantly via `DROP TABLE`.
 - Avoids bloat and heavy table-locking `DELETE` queries.
+
+Messages and their deliveries are kept for `MESSAGE_RETENTION_DAYS` (30) once every delivery has finished, then deleted in small batches by the same hourly task. Unfinished messages are never deleted.
 
 ### SDK & Developer Tools
 
@@ -253,7 +255,7 @@ stops everything. To receive webhooks in your own code, see
 | [docs/api.md](docs/api.md) and [docs/openapi.json](docs/openapi.json) | The HTTP API: routes, idempotency, pagination, errors |
 | [docs/sdk-and-cli.md](docs/sdk-and-cli.md) | The Go SDK and `webhookctl` |
 | [docs/delivery.md](docs/delivery.md) | How delivery works: fairness, retries, circuit breaker, replay, rotation |
-| [docs/operations.md](docs/operations.md) | Running it: configuration, scaling, retention, metrics |
+| [docs/operations.md](docs/operations.md) | Running it: every setting, a production checklist, scaling, retention, metrics |
 | [docs/writeup.md](docs/writeup.md) | The design, and why: queue, fairness, failure handling, measurements |
 
 ## Benchmarks
@@ -269,12 +271,12 @@ CPU. Every run delivered every message, with no duplicates.
 
 | Dispatchers | Burst throughput (60 000 deliveries) | Steady lag at 400 deliveries/s, p50 / p99 |
 | --- | --- | --- |
-| 1 | 540 deliveries/s | 24 ms / 155 ms |
-| 2 | 956 deliveries/s | 78 ms / 256 ms |
-| 4 | 1 437 deliveries/s | 76 ms / 240 ms |
+| 1 | 560 deliveries/s | 9 ms / 45 ms |
+| 2 | 1 056 deliveries/s | 8 ms / 21 ms |
+| 4 | 1 584 deliveries/s | 8 ms / 24 ms |
 
-Steady lag is mostly the 250 ms poll interval: an idle dispatcher checks
-for new work four times a second.
+New messages wake dispatchers through `LISTEN/NOTIFY`. Before it, with
+a 250 ms poll, the same runs had a steady p99 of 155 to 256 ms.
 
 ## Develop
 
@@ -285,6 +287,7 @@ otherwise.
 make up      # start the stack (Postgres on localhost:5432)
 make test    # go test -race ./...  (includes the crash test at 2 000 messages)
 make lint    # gofmt, go vet, staticcheck
+make vuln    # govulncheck
 make down
 
 # The full crash test from the design doc:
@@ -317,6 +320,20 @@ ADMIN_URL=postgres://postgres@localhost:5432/postgres scripts/bench.sh
 | 3 · Fairness and scale ✓ | Per-endpoint concurrency and rate limits, multiple dispatchers, partitioned attempts, load generator |
 | 4 · Developer experience ✓ | OpenAPI spec, Go SDK, `VerifyRequest()` for receivers, CLI, docs |
 | 5 · Launch ✓ | Benchmarks in this README, write-up, v1.0 |
+
+## Known issues
+
+- One burst benchmark run during development showed delivery stalling after
+  the burst. It has not been reproduced since. If you see deliveries sit due
+  while dispatchers are idle, please open an issue with your
+  `webhookd_delivery_lag_seconds` histogram and dispatcher logs.
+- The claim query looks at every active endpoint, so it slows down with
+  tens of thousands of endpoints (about 190 ms per claim with 10 000; see
+  [docs/operations.md](docs/operations.md#scale)).
+
+## Security
+
+Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
