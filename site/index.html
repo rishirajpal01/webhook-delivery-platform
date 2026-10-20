@@ -1,0 +1,843 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23dcf0e6'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%230a7a57'/%3E%3C/svg%3E">
+<link rel="canonical" href="https://webhook-delivery-platform.rishirajpal.com/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://webhook-delivery-platform.rishirajpal.com/">
+<meta property="og:title" content="webhook-delivery-platform">
+<meta property="og:description" content="A self-hostable webhook delivery service in Go and Postgres: at-least-once delivery, fair scheduling, retries, signing and an SSRF guard.">
+<meta property="og:image" content="https://webhook-delivery-platform.rishirajpal.com/architecture-light.png">
+<meta name="twitter:card" content="summary_large_image">
+<title>webhook-delivery-platform</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="A self-hostable webhook delivery service in Go and Postgres: at-least-once delivery, fair per-endpoint scheduling, retries, Standard Webhooks signing and an SSRF guard.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700;800&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column (max 1080px) of full-width bands; each section is a heading, one line of copy and an animated diagram. Green means delivered, amber means in flight or retrying. */
+:root {
+  --bg: #f3f6f8;
+  --surface: #ffffff;
+  --ink: #13202a;
+  --muted: #56646f;
+  --line: #d3dbe2;
+  --accent: #0a7a57;
+  --accent-soft: #dcf0e6;
+  --warn: #b0600f;
+  --warn-soft: #f8e8d4;
+  --fail: #b3261e;
+  --code-bg: #0f1820;
+  --code-ink: #d7e2ea;
+  --code-dim: #7f909d;
+  --font-display: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --step--1: 0.875rem;
+  --step-0: 1.0625rem;
+  --step-1: 1.3rem;
+  --step-2: 1.75rem;
+  --step-3: clamp(2.2rem, 5vw, 3.4rem);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1318; --surface: #141c23; --ink: #e5ebf0; --muted: #94a3ae; --line: #2a3742;
+    --accent: #3cc48f; --accent-soft: #10291f; --warn: #e49a4c; --warn-soft: #2e2113; --fail: #f07167;
+    --code-bg: #091015; --code-ink: #d7e2ea; --code-dim: #75868f;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d1318; --surface: #141c23; --ink: #e5ebf0; --muted: #94a3ae; --line: #2a3742;
+  --accent: #3cc48f; --accent-soft: #10291f; --warn: #e49a4c; --warn-soft: #2e2113; --fail: #f07167;
+  --code-bg: #091015; --code-ink: #d7e2ea; --code-dim: #75868f;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 var(--step-0)/1.6 var(--font-body);
+  margin: 0;
+}
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+h1, h2, h3 { font-family: var(--font-display); line-height: 1.15; text-wrap: balance; margin: 0; }
+h1 { font-size: var(--step-3); font-weight: 800; letter-spacing: -0.02em; }
+h2 { font-size: var(--step-2); font-weight: 700; letter-spacing: -0.01em; }
+h3 { font-size: var(--step-1); font-weight: 700; }
+p { margin: 0; }
+a { color: var(--accent); text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+code { font-family: var(--font-mono); font-size: 0.88em; }
+:not(pre) > code { background: var(--accent-soft); padding: 0.1em 0.35em; border-radius: 4px; }
+.eyebrow {
+  font: 600 var(--step--1)/1.2 var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.lede { color: var(--muted); font-size: var(--step-1); line-height: 1.5; max-width: 32em; }
+.prose { max-width: 65ch; color: var(--muted); }
+
+/* Header */
+.top { border-bottom: 1px solid var(--line); }
+.top .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; justify-content: space-between; padding-block: 16px; }
+.brand { font: 700 1rem/1 var(--font-mono); color: var(--ink); text-decoration: none; display: flex; gap: 10px; align-items: center; }
+.brand .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.top nav { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: var(--step--1); }
+.top nav a { color: var(--muted); text-decoration: none; }
+.top nav a:hover { color: var(--ink); }
+
+/* Sections */
+section { padding-block: 72px; border-bottom: 1px solid var(--line); }
+section > .wrap { display: grid; gap: 28px; }
+.head { display: grid; gap: 12px; }
+
+/* Hero */
+.hero { padding-block: 64px 72px; }
+.hero .wrap { grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 48px; align-items: center; }
+.hero-text { display: grid; gap: 22px; min-width: 0; }
+.ctas { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  font: 600 var(--step-0)/1 var(--font-body);
+  padding: 12px 18px; border-radius: 8px; text-decoration: none;
+  border: 1px solid var(--line); color: var(--ink); background: var(--surface);
+}
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.btn:hover { border-color: var(--accent); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; margin: 0; }
+.chips li { font: 400 var(--step--1)/1 var(--font-mono); color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; }
+
+.trace { background: var(--code-bg); color: var(--code-ink); border-radius: 12px; overflow: hidden; min-width: 0; margin: 0; box-shadow: 0 18px 40px -24px rgba(10, 30, 40, 0.55); }
+.trace-bar { display: flex; justify-content: space-between; gap: 12px; padding: 10px 16px; font: 400 0.75rem/1.4 var(--font-mono); color: var(--code-dim); border-bottom: 1px solid rgba(255,255,255,0.08); }
+.trace pre { margin: 0; padding: 16px; font: 400 0.8rem/1.65 var(--font-mono); overflow-x: auto; }
+.trace .k { color: #8fc7ff; }
+.trace .d { color: var(--code-dim); }
+.trace .s { color: #b9e3a5; }
+.attempts { list-style: none; margin: 0; padding: 12px 16px 16px; display: grid; gap: 8px; border-top: 1px solid rgba(255,255,255,0.08); font: 400 0.8rem/1.4 var(--font-mono); }
+.attempts li { display: grid; grid-template-columns: 2.4em 4.6em minmax(0, 1fr); gap: 10px; align-items: baseline; }
+.badge { font-weight: 600; padding: 2px 6px; border-radius: 4px; text-align: center; }
+.badge.ok { background: #1f5c43; color: #c9f5e0; }
+.badge.retry { background: #5c3d17; color: #fbdcb6; }
+
+/* Proof numbers */
+.proof { padding-block: 40px; background: var(--surface); }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 24px; margin: 0; }
+.stat { display: grid; gap: 6px; align-content: start; padding-left: 16px; border-left: 2px solid var(--accent); }
+.stat dt { order: 2; color: var(--muted); font-size: var(--step--1); line-height: 1.45; }
+.stat dd { order: 1; margin: 0; font: 800 2rem/1.1 var(--font-display); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.stat dd small { font-size: 1rem; font-weight: 700; color: var(--muted); }
+
+/* Animated figures */
+.figure { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin: 0; min-width: 0; }
+.figure .scroll { overflow-x: auto; padding: 18px 10px 10px; }
+.figure svg { display: block; width: 100%; min-width: 620px; height: auto; }
+.figure figcaption { padding: 14px 18px 16px; color: var(--muted); font-size: var(--step--1); border-top: 1px solid var(--line); }
+.figure figcaption strong { color: var(--ink); font-weight: 600; }
+.figs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+
+svg .box { fill: var(--bg); stroke: var(--line); stroke-width: 1.5; }
+svg .t { fill: var(--ink); font: 700 16px var(--font-display); }
+svg .s { fill: var(--muted); font: 400 12px var(--font-mono); }
+svg .wire { stroke: var(--line); stroke-width: 2; stroke-dasharray: 5 6; fill: none; }
+svg .dot { fill: var(--accent); opacity: 0; }
+svg .dot.amber { fill: var(--warn); }
+svg .okl { fill: var(--accent); font: 600 12px var(--font-mono); }
+svg .warnl { fill: var(--warn); font: 600 12px var(--font-mono); }
+svg .faill { fill: var(--fail); font: 600 12px var(--font-mono); }
+
+/* Pipeline (how it works). Resting state = everything delivered. */
+.pipe .row { fill: var(--accent); }
+.pipe .rx { stroke: var(--accent); fill: var(--accent-soft); }
+
+.steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); counter-reset: step; border-top: 1px solid var(--line); }
+.steps li { padding: 14px 18px 16px; display: grid; gap: 4px; align-content: start; counter-increment: step; border-left: 1px solid var(--line); min-width: 0; }
+.steps li:first-child { border-left: 0; }
+.steps li::before { content: counter(step, decimal-leading-zero); font: 600 var(--step--1)/1 var(--font-mono); color: var(--accent); }
+.steps h3 { font-size: var(--step-0); }
+.steps p { color: var(--muted); font-size: var(--step--1); line-height: 1.45; }
+
+/* Retry timeline. Resting state = attempts 1-3 failed, 4 delivered, 5-10 not needed. */
+.retry .axis { stroke: var(--line); stroke-width: 2; }
+.retry .tick { stroke: var(--line); }
+.retry .tl { fill: var(--muted); font: 400 12px var(--font-mono); }
+.retry .n { fill: var(--ink); font: 600 13px var(--font-mono); }
+.retry .gap { fill: var(--muted); font: 400 12px var(--font-mono); }
+.retry .brk { stroke: var(--muted); stroke-width: 1.5; }
+.retry .att { fill: var(--warn); }
+.retry .a4 { fill: var(--accent); }
+.retry .later { fill: var(--surface); stroke: var(--muted); stroke-width: 1.5; }
+.retry .cursor { stroke: var(--ink); stroke-width: 1.5; opacity: 0; }
+
+/* Crash recovery. Resting state = A crashed, B delivered. */
+.crash .pill { fill: var(--accent-soft); }
+.crash .st-fl, .crash .st-pd { opacity: 0; }
+.crash .st-fl { fill: var(--warn); }
+.crash .st-pd { fill: var(--muted); }
+.crash .st-ok { fill: var(--accent); }
+.crash .lease-bg { fill: var(--line); }
+.crash .lease { fill: var(--warn); opacity: 0; transform-box: fill-box; transform-origin: left center; }
+.crash .expired { opacity: 0; }
+.crash .boxA { stroke: var(--fail); }
+.crash .subA { opacity: 0; }
+.crash .rx { stroke: var(--accent); fill: var(--accent-soft); }
+
+.failing { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px 28px; margin: 0; }
+.failing div { display: grid; gap: 4px; align-content: start; padding-top: 12px; border-top: 2px solid var(--line); }
+.failing dt { font: 700 var(--step-0)/1.3 var(--font-display); }
+.failing dd { margin: 0; color: var(--muted); font-size: var(--step--1); line-height: 1.45; }
+
+/* Fairness widget */
+.fair-body { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 24px 36px; padding: 22px; align-items: center; }
+.slots-label { font: 400 var(--step--1)/1.3 var(--font-mono); color: var(--muted); margin-bottom: 10px; }
+.slots { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 8px; max-width: 440px; }
+.slot { aspect-ratio: 1; max-width: 100%; border-radius: 6px; background: var(--accent); }
+.slot.slow { background: var(--warn); }
+.fair[data-cap="off"] .slot { background: var(--warn); }
+.fair-key { margin: 0; display: grid; gap: 16px; }
+.fair-key dt { font: 700 var(--step-0)/1.3 var(--font-display); display: flex; gap: 10px; align-items: center; }
+.fair-key dd { margin: 4px 0 0 24px; color: var(--muted); font-size: var(--step--1); }
+.sw { width: 14px; height: 14px; border-radius: 4px; flex: none; }
+.sw.slow { background: var(--warn); }
+.sw.fast { background: var(--accent); }
+.verdict { font-weight: 600; }
+.verdict.good { color: var(--accent); }
+.verdict.bad { color: var(--fail); }
+.fair .when-off { display: none; }
+.fair[data-cap="off"] .when-off { display: inline; }
+.fair[data-cap="off"] .when-on { display: none; }
+.fair figcaption { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; }
+.fair figcaption p { flex: 1 1 22em; min-width: 0; }
+.toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; flex: none; }
+.toggle button { font: 600 var(--step--1)/1 var(--font-body); padding: 9px 14px; border: 0; background: var(--surface); color: var(--muted); cursor: pointer; }
+.toggle button + button { border-left: 1px solid var(--line); }
+.toggle button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+
+.decisions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.decision { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.decision h3 { font-size: var(--step-0); }
+.decision p { color: var(--muted); font-size: var(--step--1); line-height: 1.5; }
+
+/* Benchmarks */
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+table { border-collapse: collapse; width: 100%; min-width: 520px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 14px 18px; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th { font: 600 var(--step--1)/1.3 var(--font-body); color: var(--muted); }
+tbody tr:last-child td { border-bottom: 0; }
+td.num { font-family: var(--font-mono); font-size: 0.95rem; }
+.bar { display: block; height: 6px; border-radius: 3px; background: var(--accent); margin-top: 8px; transform-origin: left center; }
+.notes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 40px; color: var(--muted); font-size: var(--step--1); }
+
+/* Quickstart */
+.code { background: var(--code-bg); color: var(--code-ink); border-radius: 12px; overflow: hidden; min-width: 0; }
+.code-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 8px 8px 16px; font: 400 0.75rem/1.4 var(--font-mono); color: var(--code-dim); border-bottom: 1px solid rgba(255,255,255,0.08); }
+.code-bar button { font: 600 0.75rem/1 var(--font-mono); color: var(--code-ink); background: transparent; border: 1px solid rgba(255,255,255,0.18); border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+.code-bar button:hover { border-color: rgba(255,255,255,0.4); }
+.code pre { margin: 0; padding: 18px 16px; font: 400 0.82rem/1.7 var(--font-mono); overflow-x: auto; }
+.code .c { color: var(--code-dim); }
+
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 40px; }
+.list { margin: 0; padding-left: 1.1em; display: grid; gap: 8px; color: var(--muted); }
+.list strong { color: var(--ink); font-weight: 600; }
+
+.diagram { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow-x: auto; }
+.diagram img { display: block; width: 100%; min-width: 860px; max-width: none; height: auto; }
+.diagram .img-dark { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .diagram .img-light { display: none; }
+  :root:not([data-theme="light"]) .diagram .img-dark { display: block; }
+}
+:root[data-theme="dark"] .diagram .img-light { display: none; }
+:root[data-theme="dark"] .diagram .img-dark { display: block; }
+details.more { color: var(--muted); font-size: var(--step--1); }
+details.more summary { cursor: pointer; color: var(--accent); font-weight: 600; margin-bottom: 12px; }
+
+footer { padding-block: 40px 56px; color: var(--muted); font-size: var(--step--1); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 32px; justify-content: space-between; }
+footer nav { display: flex; flex-wrap: wrap; gap: 6px 20px; }
+
+@media (max-width: 900px) {
+  .hero .wrap, .two, .fair-body { grid-template-columns: minmax(0, 1fr); }
+  .stats, .failing { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .failing div:last-child { grid-column: 1 / -1; }
+  .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .steps li:nth-child(3) { border-left: 0; }
+  .steps li:nth-child(n+3) { border-top: 1px solid var(--line); }
+  .decisions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  section { padding-block: 52px; }
+  .stats, .steps, .decisions, .failing, .notes { grid-template-columns: minmax(0, 1fr); }
+  .steps li { border-left: 0; }
+  .steps li + li { border-top: 1px solid var(--line); }
+  .slots { gap: 6px; }
+}
+
+/* Motion. Without it, every figure shows its resting state above. */
+@media (prefers-reduced-motion: no-preference) {
+  .attempts li { animation: arrive 0.5s ease-out both; }
+  .attempts li:nth-child(2) { animation-delay: 0.35s; }
+  @keyframes arrive { from { transform: translateY(4px); opacity: 0.4; } to { transform: none; opacity: 1; } }
+
+  /* Pipeline, 8 s loop: accept 0-28%, claim 28-46%, send 46-60%, record 60-90% */
+  .pipe * { animation-duration: 8s; animation-iteration-count: infinite; animation-timing-function: ease-in-out; }
+  .pipe .msg { animation-name: p-msg; }
+  .pipe .d1 { animation-name: p-d1; }
+  .pipe .d2 { animation-name: p-d2; }
+  .pipe .d3 { animation-name: p-d3; }
+  .pipe .row { animation-name: p-row; }
+  .pipe .api { animation-name: p-api; }
+  .pipe .disp { animation-name: p-disp; }
+  .pipe .rx { animation-name: p-rx; }
+  .pipe .okl { animation-name: p-ok; }
+  .steps li { animation: 8s infinite both; }
+  .pipe-fig .steps li:nth-child(1) { animation-name: cap1; }
+  .pipe-fig .steps li:nth-child(2) { animation-name: cap2; }
+  .pipe-fig .steps li:nth-child(3) { animation-name: cap3; }
+  .pipe-fig .steps li:nth-child(4) { animation-name: cap4; }
+  @keyframes p-msg {
+    0% { transform: translate(150px, 130px); opacity: 0; }
+    4% { opacity: 1; }
+    12% { transform: translate(200px, 130px); }
+    18% { transform: translate(340px, 130px); }
+    26% { transform: translate(390px, 130px); opacity: 1; }
+    28%, 100% { transform: translate(390px, 130px); opacity: 0; }
+  }
+  @keyframes p-d1 {
+    0%, 36% { transform: translate(540px, 130px); opacity: 0; }
+    38% { opacity: 1; }
+    44% { transform: translate(590px, 130px); }
+    48% { transform: translate(730px, 130px); }
+    58% { transform: translate(790px, 50px); opacity: 1; }
+    60%, 100% { transform: translate(790px, 50px); opacity: 0; }
+  }
+  @keyframes p-d2 {
+    0%, 36% { transform: translate(540px, 130px); opacity: 0; }
+    38% { opacity: 1; }
+    44% { transform: translate(590px, 130px); }
+    48% { transform: translate(730px, 130px); }
+    58% { transform: translate(790px, 130px); opacity: 1; }
+    60%, 100% { transform: translate(790px, 130px); opacity: 0; }
+  }
+  @keyframes p-d3 {
+    0%, 36% { transform: translate(540px, 130px); opacity: 0; }
+    38% { opacity: 1; }
+    44% { transform: translate(590px, 130px); }
+    48% { transform: translate(730px, 130px); }
+    58% { transform: translate(790px, 210px); opacity: 1; }
+    60%, 100% { transform: translate(790px, 210px); opacity: 0; }
+  }
+  @keyframes p-row {
+    0%, 26% { fill: var(--line); opacity: 0; }
+    30% { fill: var(--muted); opacity: 1; }
+    36%, 58% { fill: var(--warn); opacity: 1; }
+    62%, 90% { fill: var(--accent); opacity: 1; }
+    100% { fill: var(--accent); opacity: 0; }
+  }
+  @keyframes p-api { 0%, 10%, 22%, 100% { stroke: var(--line); } 12%, 20% { stroke: var(--accent); } }
+  @keyframes p-disp { 0%, 34%, 52%, 100% { stroke: var(--line); } 38%, 50% { stroke: var(--warn); } }
+  @keyframes p-rx {
+    0%, 57% { stroke: var(--line); fill: var(--bg); }
+    60%, 90% { stroke: var(--accent); fill: var(--accent-soft); }
+    100% { stroke: var(--line); fill: var(--bg); }
+  }
+  @keyframes p-ok { 0%, 57% { opacity: 0; } 60%, 90% { opacity: 1; } 100% { opacity: 0; } }
+  @keyframes cap1 { 0%, 26% { opacity: 1; } 30%, 96% { opacity: 0.4; } 100% { opacity: 1; } }
+  @keyframes cap2 { 0%, 28% { opacity: 0.4; } 32%, 44% { opacity: 1; } 48%, 100% { opacity: 0.4; } }
+  @keyframes cap3 { 0%, 44% { opacity: 0.4; } 48%, 58% { opacity: 1; } 62%, 100% { opacity: 0.4; } }
+  @keyframes cap4 { 0%, 58% { opacity: 0.4; } 62%, 90% { opacity: 1; } 94%, 100% { opacity: 0.4; } }
+
+  /* Retry timeline, 7 s loop: the cursor reaches attempts 2, 3, 4 at 27%, 47%, 62% */
+  .retry * { animation-duration: 7s; animation-iteration-count: infinite; }
+  .retry .cursor { animation-name: r-cur; animation-timing-function: linear; }
+  .retry .a1 { animation-name: r-a1; }
+  .retry .a2 { animation-name: r-a2; }
+  .retry .a3 { animation-name: r-a3; }
+  .retry .a4 { animation-name: r-a4; }
+  .retry .ok4 { animation-name: r-ok; }
+  @keyframes r-cur {
+    0%, 5% { transform: translateX(30px); opacity: 0.6; }
+    62% { transform: translateX(442.7px); opacity: 0.6; }
+    68%, 100% { transform: translateX(442.7px); opacity: 0; }
+  }
+  @keyframes r-a1 { 0%, 4% { fill: var(--line); } 6%, 94% { fill: var(--warn); } 100% { fill: var(--line); } }
+  @keyframes r-a2 { 0%, 26% { fill: var(--line); } 28%, 94% { fill: var(--warn); } 100% { fill: var(--line); } }
+  @keyframes r-a3 { 0%, 46% { fill: var(--line); } 48%, 94% { fill: var(--warn); } 100% { fill: var(--line); } }
+  @keyframes r-a4 { 0%, 61% { fill: var(--line); } 63%, 94% { fill: var(--accent); } 100% { fill: var(--line); } }
+  @keyframes r-ok { 0%, 61% { opacity: 0; } 63%, 94% { opacity: 1; } 100% { opacity: 0; } }
+
+  /* Crash recovery, 9 s loop */
+  .crash * { animation-duration: 9s; animation-iteration-count: infinite; animation-timing-function: ease-in-out; }
+  .crash .c1 { animation-name: c-1; }
+  .crash .c2 { animation-name: c-2; }
+  .crash .pill { animation-name: c-pill; }
+  .crash .st-fl { animation-name: c-fl; }
+  .crash .st-pd { animation-name: c-pd; }
+  .crash .st-ok { animation-name: c-ok; }
+  .crash .lease { animation-name: c-lease; animation-timing-function: linear; }
+  .crash .expired { animation-name: c-exp; }
+  .crash .boxA { animation-name: c-boxA; }
+  .crash .subA { animation-name: c-subA; }
+  .crash .killA { animation-name: c-killA; }
+  .crash .rx { animation-name: c-rx; }
+  .crash .okl { animation-name: c-ok; }
+  @keyframes c-1 {
+    0% { transform: translate(230px, 95px); opacity: 0; }
+    2% { opacity: 1; }
+    10% { transform: translate(330px, 48px); }
+    12% { transform: translate(510px, 48px); }
+    22% { transform: translate(600px, 66px); opacity: 1; }
+    24%, 100% { transform: translate(600px, 66px); opacity: 0; }
+  }
+  @keyframes c-2 {
+    0%, 58% { transform: translate(230px, 115px); opacity: 0; }
+    60% { opacity: 1; }
+    66% { transform: translate(330px, 162px); }
+    68% { transform: translate(510px, 162px); }
+    78% { transform: translate(740px, 115px); opacity: 1; }
+    80%, 100% { transform: translate(740px, 115px); opacity: 0; }
+  }
+  @keyframes c-pill {
+    0%, 4% { fill: var(--line); }
+    6%, 54% { fill: var(--warn-soft); }
+    56%, 60% { fill: var(--line); }
+    62%, 78% { fill: var(--warn-soft); }
+    80%, 95% { fill: var(--accent-soft); }
+    100% { fill: var(--line); }
+  }
+  @keyframes c-fl { 0%, 4% { opacity: 0; } 6%, 54% { opacity: 1; } 56%, 60% { opacity: 0; } 62%, 78% { opacity: 1; } 80%, 100% { opacity: 0; } }
+  @keyframes c-pd { 0%, 4% { opacity: 1; } 6%, 54% { opacity: 0; } 56%, 60% { opacity: 1; } 62%, 95% { opacity: 0; } 100% { opacity: 1; } }
+  @keyframes c-ok { 0%, 78% { opacity: 0; } 80%, 95% { opacity: 1; } 100% { opacity: 0; } }
+  @keyframes c-lease {
+    0%, 5% { transform: scaleX(1); opacity: 0; }
+    6% { transform: scaleX(1); opacity: 1; }
+    54% { transform: scaleX(0); opacity: 1; }
+    60% { transform: scaleX(0); opacity: 1; }
+    62% { transform: scaleX(1); opacity: 1; }
+    78% { transform: scaleX(0.66); opacity: 1; }
+    80%, 100% { transform: scaleX(0.66); opacity: 0; }
+  }
+  @keyframes c-exp { 0%, 53% { opacity: 0; } 55%, 61% { opacity: 1; } 63%, 100% { opacity: 0; } }
+  @keyframes c-boxA { 0%, 22% { stroke: var(--line); } 24%, 95% { stroke: var(--fail); } 100% { stroke: var(--line); } }
+  @keyframes c-subA { 0%, 22% { opacity: 1; } 24%, 95% { opacity: 0; } 100% { opacity: 1; } }
+  @keyframes c-killA { 0%, 22% { opacity: 0; } 24%, 95% { opacity: 1; } 100% { opacity: 0; } }
+  @keyframes c-rx {
+    0%, 77% { stroke: var(--line); fill: var(--bg); }
+    80%, 95% { stroke: var(--accent); fill: var(--accent-soft); }
+    100% { stroke: var(--line); fill: var(--bg); }
+  }
+
+  /* Fairness: healthy slots turn over fast, slow slots stay busy */
+  .slot { animation: blink 0.9s ease-in-out infinite; animation-delay: var(--d, 0s); }
+  .slot.slow, .fair[data-cap="off"] .slot { animation: busy 3s ease-in-out infinite; animation-delay: var(--d, 0s); }
+  @keyframes blink { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+  @keyframes busy { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+  .bar { animation: grow 1.2s ease-out both; }
+  @keyframes grow { from { transform: scaleX(0.05); } to { transform: none; } }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="dot" aria-hidden="true"></span>webhook-delivery-platform</a>
+    <nav aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#failure">Failure handling</a>
+      <a href="#fairness">Fairness</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="https://github.com/rishirajpal01/webhook-delivery-platform">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-text">
+        <p class="eyebrow">Open source · v1.0</p>
+        <h1>Send an event once. Every endpoint gets it.</h1>
+        <p class="lede">A self-hostable webhook delivery service in Go and Postgres. It fans each event out, signs it, retries for about 23 hours and records every attempt.</p>
+        <div class="ctas">
+          <a class="btn primary" href="https://github.com/rishirajpal01/webhook-delivery-platform">View on GitHub</a>
+          <a class="btn" href="https://github.com/rishirajpal01/webhook-delivery-platform/blob/main/docs/writeup.md">Read the design write-up</a>
+        </div>
+        <ul class="chips" aria-label="Stack">
+          <li>Go 1.25</li>
+          <li>Postgres only</li>
+          <li>Standard Webhooks</li>
+          <li>OpenAPI 3.1</li>
+          <li>Apache-2.0</li>
+        </ul>
+      </div>
+
+      <figure class="trace" aria-label="Example of one signed webhook request and its two attempts">
+        <div class="trace-bar"><span>example delivery</span><span>order.paid → 1 endpoint</span></div>
+<pre><span class="k">POST</span> https://api.acme.example/hooks
+<span class="k">webhook-id:</span> msg_2pQx7Lr4vK9tNcW1
+<span class="k">webhook-timestamp:</span> 1792486000
+<span class="k">webhook-signature:</span> v1,<span class="d">K3Yq0b6p…HMAC-SHA256…=</span>
+<span class="k">content-type:</span> application/json
+
+{<span class="s">"type"</span>:<span class="s">"order.paid"</span>,
+ <span class="s">"timestamp"</span>:<span class="s">"2026-10-20T08:46:40Z"</span>,
+ <span class="s">"data"</span>:{<span class="s">"order_id"</span>:<span class="s">"981"</span>,<span class="s">"amount"</span>:4999}}</pre>
+        <ol class="attempts">
+          <li><span>#1</span><span class="badge retry">503</span><span>retry in 5 s, ±25% jitter</span></li>
+          <li><span>#2</span><span class="badge ok">200</span><span>delivered, same webhook-id</span></li>
+        </ol>
+      </figure>
+    </div>
+  </section>
+
+  <section class="proof" aria-label="Measured results">
+    <div class="wrap">
+      <dl class="stats">
+        <div class="stat"><dt>messages lost across 8 <code>kill -9</code>s of the dispatcher, out of 100,000 sent</dt><dd>0</dd></div>
+        <div class="stat"><dt>burst throughput with 4 dispatchers, all on one 4-CPU VM</dt><dd>1,584<small> /s</small></dd></div>
+        <div class="stat"><dt>healthy endpoints' p99 lag while a 10-second endpoint is backlogged</dt><dd>~30<small> ms</small></dd></div>
+        <div class="stat"><dt>p99 lag at a steady 400 deliveries/s, from send call to arrival</dt><dd>24<small> ms</small></dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">How it works</p>
+        <h2>One Go binary, one Postgres database</h2>
+        <p class="prose">No Kafka, Redis or Kubernetes. The API and the dispatchers share nothing but Postgres, so you can run as many of each as you need.</p>
+      </div>
+      <figure class="figure pipe-fig">
+        <div class="scroll">
+          <svg class="pipe" viewBox="0 0 940 260" role="img" aria-label="Animation: your product sends one message to the API, which stores it in Postgres with one delivery row per endpoint. A dispatcher claims the rows and sends three signed requests, one to each endpoint, and each answers 200 OK.">
+            <line class="wire" x1="150" y1="130" x2="200" y2="130"/>
+            <line class="wire" x1="340" y1="130" x2="390" y2="130"/>
+            <line class="wire" x1="540" y1="130" x2="590" y2="130"/>
+            <line class="wire" x1="730" y1="130" x2="790" y2="50"/>
+            <line class="wire" x1="730" y1="130" x2="790" y2="130"/>
+            <line class="wire" x1="730" y1="130" x2="790" y2="210"/>
+
+            <rect class="box" x="10" y="98" width="140" height="64" rx="10"/>
+            <text class="t" x="80" y="126" text-anchor="middle">Your product</text>
+            <text class="s" x="80" y="146" text-anchor="middle">sends once</text>
+
+            <rect class="box api" x="200" y="98" width="140" height="64" rx="10"/>
+            <text class="t" x="270" y="126" text-anchor="middle">API</text>
+            <text class="s" x="270" y="146" text-anchor="middle">1 transaction</text>
+
+            <rect class="box" x="390" y="74" width="150" height="112" rx="10"/>
+            <text class="t" x="465" y="100" text-anchor="middle">Postgres</text>
+            <rect class="row" x="405" y="114" width="120" height="14" rx="4"/>
+            <rect class="row" x="405" y="134" width="120" height="14" rx="4"/>
+            <rect class="row" x="405" y="154" width="120" height="14" rx="4"/>
+
+            <rect class="box disp" x="590" y="98" width="140" height="64" rx="10"/>
+            <text class="t" x="660" y="126" text-anchor="middle">Dispatcher</text>
+            <text class="s" x="660" y="146" text-anchor="middle">claim · sign</text>
+
+            <rect class="box rx" x="790" y="26" width="140" height="48" rx="10"/>
+            <text class="t" x="860" y="47" text-anchor="middle">Endpoint A</text>
+            <text class="okl" x="860" y="65" text-anchor="middle">200 OK</text>
+            <rect class="box rx" x="790" y="106" width="140" height="48" rx="10"/>
+            <text class="t" x="860" y="127" text-anchor="middle">Endpoint B</text>
+            <text class="okl" x="860" y="145" text-anchor="middle">200 OK</text>
+            <rect class="box rx" x="790" y="186" width="140" height="48" rx="10"/>
+            <text class="t" x="860" y="207" text-anchor="middle">Endpoint C</text>
+            <text class="okl" x="860" y="225" text-anchor="middle">200 OK</text>
+
+            <circle class="dot msg" r="8"/>
+            <circle class="dot amber d1" r="6"/>
+            <circle class="dot amber d2" r="6"/>
+            <circle class="dot amber d3" r="6"/>
+          </svg>
+        </div>
+        <ol class="steps">
+          <li><h3>Accept</h3><p>The message and one delivery row per endpoint, saved together.</p></li>
+          <li><h3>Claim</h3><p>Rows locked with <code>SKIP LOCKED</code> and a 30 s lease.</p></li>
+          <li><h3>Send</h3><p>Signed with HMAC-SHA256, through an SSRF guard.</p></li>
+          <li><h3>Record</h3><p>Every attempt logged. Green rows are delivered.</p></li>
+        </ol>
+      </figure>
+      <details class="more">
+        <summary>See the full architecture diagram</summary>
+        <div class="diagram">
+          <img class="img-light" src="architecture-light.png" width="3012" height="1054" loading="lazy" alt="Architecture: your product sends to the webhookd API, which writes the message and its deliveries to Postgres in one transaction. Dispatchers claim deliveries with SKIP LOCKED and a lease, record each attempt in a day-partitioned log, and send signed requests through an SSRF guard to receiver endpoints.">
+          <img class="img-dark" src="architecture-dark.png" width="3012" height="1054" loading="lazy" alt="" aria-hidden="true">
+        </div>
+        <p style="margin-top:10px">The <a href="https://github.com/rishirajpal01/webhook-delivery-platform/tree/main/docs/architecture">interactive version</a> links every box to its source code.</p>
+      </details>
+    </div>
+  </section>
+
+  <section id="failure">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Failure handling</p>
+        <h2>Delivered at least once, even through crashes</h2>
+        <p class="prose">Every request carries a stable <code>webhook-id</code>, so a receiver can safely drop a repeat.</p>
+      </div>
+      <div class="figs">
+        <figure class="figure">
+          <div class="scroll">
+            <svg class="retry" viewBox="0 0 940 160" role="img" aria-label="Animation of the retry schedule on a log time scale. Attempts 1 to 3 fail, attempt 4 two and a half minutes after the send gets 200 OK. The schedule continues with retries after 10 min, 30 min, 1 h, 3 h, 6 h and 12 h, about 22.7 hours in total.">
+              <line class="axis" x1="70" y1="80" x2="910" y2="80"/>
+              <line class="axis" x1="22" y1="80" x2="46" y2="80"/>
+              <line class="brk" x1="50" y1="88" x2="58" y2="72"/>
+              <line class="brk" x1="57" y1="88" x2="65" y2="72"/>
+              <line class="tick" x1="240.2" y1="86" x2="240.2" y2="94"/><text class="tl" x="240.2" y="112" text-anchor="middle">10 s</text>
+              <line class="tick" x1="372.6" y1="86" x2="372.6" y2="94"/><text class="tl" x="372.6" y="112" text-anchor="middle">1 min</text>
+              <line class="tick" x1="542.7" y1="86" x2="542.7" y2="94"/><text class="tl" x="542.7" y="112" text-anchor="middle">10 min</text>
+              <line class="tick" x1="675.1" y1="86" x2="675.1" y2="94"/><text class="tl" x="675.1" y="112" text-anchor="middle">1 h</text>
+              <line class="tick" x1="807.6" y1="86" x2="807.6" y2="94"/><text class="tl" x="807.6" y="112" text-anchor="middle">6 h</text>
+              <line class="tick" x1="910" y1="86" x2="910" y2="94"/><text class="tl" x="910" y="112" text-anchor="end">24 h</text>
+              <text class="tl" x="30" y="112" text-anchor="middle">send</text>
+
+              <line class="cursor" x1="0" y1="62" x2="0" y2="98"/>
+              <circle class="att a1" cx="30" cy="80" r="7"/><text class="n" x="30" y="56" text-anchor="middle">1</text>
+              <circle class="att a2" cx="188.9" cy="80" r="7"/><text class="n" x="188.9" y="56" text-anchor="middle">2</text><text class="gap" x="188.9" y="36" text-anchor="middle">+5 s</text>
+              <circle class="att a3" cx="332.7" cy="80" r="7"/><text class="n" x="332.7" y="56" text-anchor="middle">3</text><text class="gap" x="332.7" y="36" text-anchor="middle">+30 s</text>
+              <circle class="att a4" cx="442.7" cy="80" r="8"/><text class="n" x="442.7" y="56" text-anchor="middle">4</text><text class="gap" x="442.7" y="36" text-anchor="middle">+2 m</text>
+              <text class="okl ok4" x="442.7" y="132" text-anchor="middle">200 OK</text>
+              <circle class="later" cx="559.7" cy="80" r="5"/><text class="n" x="559.7" y="56" text-anchor="middle">5</text><text class="gap" x="559.7" y="36" text-anchor="middle">+10 m</text>
+              <circle class="later" cx="649.8" cy="80" r="5"/><text class="n" x="649.8" y="56" text-anchor="middle">6</text><text class="gap" x="649.8" y="36" text-anchor="middle">+30 m</text>
+              <circle class="later" cx="714.8" cy="80" r="5"/><text class="n" x="714.8" y="56" text-anchor="middle">7</text><text class="gap" x="714.8" y="36" text-anchor="middle">+1 h</text>
+              <circle class="later" cx="789.7" cy="80" r="5"/><text class="n" x="789.7" y="56" text-anchor="middle">8</text><text class="gap" x="789.7" y="36" text-anchor="middle">+3 h</text>
+              <circle class="later" cx="850.4" cy="80" r="5"/><text class="n" x="850.4" y="56" text-anchor="middle">9</text><text class="gap" x="850.4" y="36" text-anchor="middle">+6 h</text>
+              <circle class="later" cx="905.9" cy="80" r="5"/><text class="n" x="899" y="56" text-anchor="middle">10</text><text class="gap" x="899" y="36" text-anchor="middle">+12 h</text>
+              <text class="tl" x="680" y="150" text-anchor="middle">time since send (log scale)</text>
+            </svg>
+          </div>
+          <figcaption><strong>Retries back off over about 23 hours.</strong> Here attempt 4 lands, so 5 to 10 never run. Each delay gets ±25% jitter.</figcaption>
+        </figure>
+
+        <figure class="figure">
+          <div class="scroll">
+            <svg class="crash" viewBox="0 0 940 210" role="img" aria-label="Animation: dispatcher A claims a delivery row and is killed mid-send. The row's lease runs out, the row returns to pending, dispatcher B claims it and the endpoint answers 200 OK.">
+              <path class="wire" d="M230 95 L330 48"/>
+              <path class="wire" d="M230 115 L330 162"/>
+              <path class="wire" d="M510 48 L740 95"/>
+              <path class="wire" d="M510 162 L740 115"/>
+
+              <rect class="box" x="20" y="64" width="210" height="80" rx="10"/>
+              <text class="t" x="38" y="92">Delivery row</text>
+              <rect class="pill" x="38" y="106" width="96" height="24" rx="12"/>
+              <text class="warnl st-fl" x="86" y="122" text-anchor="middle">in flight</text>
+              <text class="warnl st-pd" x="86" y="122" text-anchor="middle">pending</text>
+              <text class="okl st-ok" x="86" y="122" text-anchor="middle">succeeded</text>
+              <text class="s" x="178" y="112" text-anchor="middle">lease</text>
+              <rect class="lease-bg" x="146" y="118" width="66" height="6" rx="3"/>
+              <rect class="lease" x="146" y="118" width="66" height="6" rx="3"/>
+              <text class="warnl expired" x="125" y="166" text-anchor="middle">lease expired → back to pending</text>
+
+              <rect class="box boxA" x="330" y="18" width="180" height="60" rx="10"/>
+              <text class="t" x="420" y="44" text-anchor="middle">Dispatcher A</text>
+              <text class="s subA" x="420" y="64" text-anchor="middle">claims, sends…</text>
+              <text class="faill killA" x="420" y="64" text-anchor="middle">✕ kill -9</text>
+
+              <rect class="box" x="330" y="132" width="180" height="60" rx="10"/>
+              <text class="t" x="420" y="158" text-anchor="middle">Dispatcher B</text>
+              <text class="s" x="420" y="178" text-anchor="middle">picks it up</text>
+
+              <rect class="box rx" x="740" y="75" width="180" height="60" rx="10"/>
+              <text class="t" x="830" y="101" text-anchor="middle">Endpoint</text>
+              <text class="okl" x="830" y="121" text-anchor="middle">200 OK</text>
+
+              <circle class="dot amber c1" r="7"/>
+              <circle class="dot amber c2" r="7"/>
+            </svg>
+          </div>
+          <figcaption><strong>A crash mid-send loses nothing.</strong> The lease runs out and another dispatcher sends it. Tested with 100,000 messages and 8 kills: 0 lost.</figcaption>
+        </figure>
+      </div>
+      <dl class="failing">
+        <div><dt>Circuit breaker</dt><dd>10 straight failures pause an endpoint. A probe reopens it.</dd></div>
+        <div><dt>Retry-After</dt><dd>Honoured on 429 and 503, up to 24 hours.</dd></div>
+        <div><dt>Auto-disable</dt><dd>After 5 days of failure, with an <code>endpoint.disabled</code> event.</dd></div>
+        <div><dt>Pause</dt><dd>A paused endpoint keeps queueing and catches up on resume.</dd></div>
+        <div><dt>Replay</dt><dd>Resend any delivery with the same <code>webhook-id</code>.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section id="fairness">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Fairness</p>
+        <h2>One slow customer can't stall everyone else</h2>
+        <p class="prose">Each endpoint gets at most 4 sends at once. Switch the cap off to see the outage it prevents.</p>
+      </div>
+      <figure class="figure fair" id="fair" data-cap="on">
+        <div class="fair-body">
+          <div>
+            <p class="slots-label">One dispatcher · 16 worker slots</p>
+            <div class="slots" aria-hidden="true">
+              <span class="slot slow" style="--d:0s"></span><span class="slot slow" style="--d:.7s"></span><span class="slot slow" style="--d:1.4s"></span><span class="slot slow" style="--d:2.1s"></span>
+              <span class="slot" style="--d:.1s"></span><span class="slot" style="--d:.5s"></span><span class="slot" style="--d:.3s"></span><span class="slot" style="--d:.7s"></span>
+              <span class="slot" style="--d:.2s"></span><span class="slot" style="--d:.6s"></span><span class="slot" style="--d:0s"></span><span class="slot" style="--d:.4s"></span>
+              <span class="slot" style="--d:.8s"></span><span class="slot" style="--d:.15s"></span><span class="slot" style="--d:.55s"></span><span class="slot" style="--d:.35s"></span>
+            </div>
+          </div>
+          <dl class="fair-key">
+            <div><dt><span class="sw slow"></span>Slow endpoint</dt><dd>answers in 10 s, 500 queued</dd></div>
+            <div><dt><span class="sw fast"></span>9 healthy endpoints</dt><dd>
+              <span class="when-on">p99 lag: <span class="verdict good">about 30 ms</span></span>
+              <span class="when-off"><span class="verdict bad">waiting behind the backlog</span></span>
+            </dd></div>
+          </dl>
+        </div>
+        <figcaption>
+          <div class="toggle" role="group" aria-label="Per-endpoint cap">
+            <button type="button" id="cap-on" aria-pressed="true">Cap on</button>
+            <button type="button" id="cap-off" aria-pressed="false">Cap off</button>
+          </div>
+          <p>
+            <span class="when-on">The slow endpoint fills its 4 slots. The other 12 keep serving everyone else.</span>
+            <span class="when-off">The slow endpoint's backlog takes every slot. The noisy-neighbour test fails exactly like this.</span>
+          </p>
+        </figcaption>
+      </figure>
+      <div class="decisions">
+        <article class="decision"><h3>The queue is a table</h3><p>The delivery row is the queue item. No outbox, no broker.</p></article>
+        <article class="decision"><h3>Limits without Redis</h3><p>Caps and GCRA rate limits live in the endpoint row, shared by every replica.</p></article>
+        <article class="decision"><h3>The lease is a fencing token</h3><p>A dispatcher frozen past its lease cannot overwrite a newer result.</p></article>
+        <article class="decision"><h3>Safe in both directions</h3><p>Standard Webhooks signatures for receivers, and an SSRF guard that refuses private addresses.</p></article>
+        <article class="decision"><h3>Idempotent sends</h3><p>A repeated <code>Idempotency-Key</code> returns the original. Reusing it with a different body gets a 422.</p></article>
+        <article class="decision"><h3>Bounded storage</h3><p>Attempts are partitioned by day, and finished messages are deleted after 30 days.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="benchmarks">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Benchmarks</p>
+        <h2>Measured, with the setup stated</h2>
+        <p class="prose">20 endpoints per message, a receiver that answers in 20 ms, everything on one 4-CPU VM. Every run delivered every message with no duplicates.</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th scope="col">Dispatchers</th><th scope="col">Burst throughput (60,000 deliveries)</th><th scope="col">Steady lag at 400/s, p50 / p99</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="num">1</td><td class="num">560 deliveries/s<span class="bar" style="width:35.4%"></span></td><td class="num">9 ms / 45 ms</td></tr>
+            <tr><td class="num">2</td><td class="num">1,056 deliveries/s<span class="bar" style="width:66.7%"></span></td><td class="num">8 ms / 21 ms</td></tr>
+            <tr><td class="num">4</td><td class="num">1,584 deliveries/s<span class="bar" style="width:100%"></span></td><td class="num">8 ms / 24 ms</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="notes">
+        <p>New messages wake dispatchers through <code>LISTEN/NOTIFY</code>. With the old 250 ms poll, steady p99 was 155 to 256 ms.</p>
+        <p>4 replicas gain less because everything shared 4 CPUs. <code>scripts/bench.sh</code> reproduces the table.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="quickstart">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Quickstart</p>
+        <h2>A verified delivery in under a minute</h2>
+        <p class="prose">Needs Docker. Starts the stack, sends one event and waits for it to arrive.</p>
+      </div>
+      <div class="code">
+        <div class="code-bar"><span>sh</span><button type="button" id="copy-quickstart">Copy</button></div>
+<pre id="quickstart-code">git clone https://github.com/rishirajpal01/webhook-delivery-platform
+cd webhook-delivery-platform
+docker compose up --build -d --wait
+ctl() { docker compose exec -T webhookd webhookctl "$@"; }
+
+<span class="c"># An app, and an endpoint pointing at the mock receiver</span>
+APP=$(ctl -o '{{.id}}' apps create demo)
+ctl endpoints create "$APP" http://mockreceiver:9000/hooks -events order.paid \
+  -secret whsec_ZGVtby1zZWNyZXQtZm9yLWxvY2FsLWRldi1vbmx5ISE=
+
+<span class="c"># Send an event and wait until it is delivered</span>
+MSG=$(ctl -o '{{.id}}' send "$APP" order.paid '{"order_id":"981","amount":4999}')
+ctl deliveries "$APP" "$MSG" -wait 5m</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap two">
+      <div class="head">
+        <p class="eyebrow">For developers</p>
+        <h2>The spec is the source of truth</h2>
+        <ul class="list">
+          <li><strong>OpenAPI 3.1</strong> with contract tests against the server and SDK.</li>
+          <li><strong>Go SDK</strong> with <code>VerifyRequest</code> for receivers.</li>
+          <li><strong>webhookctl</strong> CLI and <strong>Prometheus</strong> metrics.</li>
+          <li><strong>Configurable</strong>: retries, circuit breaker, lease and connection pool are environment settings.</li>
+        </ul>
+      </div>
+      <div class="head">
+        <p class="eyebrow">Next</p>
+        <h2>What I would build next</h2>
+        <ul class="list">
+          <li><strong>Opt-in FIFO</strong> per endpoint.</li>
+          <li><strong>Separate-machine benchmarks</strong> to find the real ceiling.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Designed and built by <a href="https://rishirajpal.com">Rishi Rajpal</a>. Apache-2.0.</p>
+    <nav aria-label="Links">
+      <a href="https://github.com/rishirajpal01/webhook-delivery-platform">Source</a>
+      <a href="https://github.com/rishirajpal01/webhook-delivery-platform/blob/main/docs/writeup.md">Write-up</a>
+      <a href="https://github.com/rishirajpal01/webhook-delivery-platform/tree/main/docs">Docs</a>
+      <a href="https://github.com/rishirajpal01">GitHub profile</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var fair = document.getElementById("fair");
+  var on = document.getElementById("cap-on");
+  var off = document.getElementById("cap-off");
+  function setCap(v) {
+    fair.dataset.cap = v;
+    on.setAttribute("aria-pressed", String(v === "on"));
+    off.setAttribute("aria-pressed", String(v === "off"));
+  }
+  on.addEventListener("click", function () { setCap("on"); });
+  off.addEventListener("click", function () { setCap("off"); });
+
+  document.getElementById("copy-quickstart").addEventListener("click", function (e) {
+    var btn = e.currentTarget;
+    var code = document.getElementById("quickstart-code");
+    navigator.clipboard.writeText(code.innerText).then(function () {
+      btn.textContent = "Copied";
+      setTimeout(function () { btn.textContent = "Copy"; }, 1600);
+    }).catch(function () {
+      var r = document.createRange();
+      r.selectNodeContents(code);
+      var s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+      btn.textContent = "Press Ctrl+C";
+    });
+  });
+})();
+</script>
+</body>
+</html>
