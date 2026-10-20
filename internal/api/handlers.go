@@ -239,10 +239,6 @@ func (s *server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// rotationOverlap is how long the old secret keeps signing requests after
-// a rotation, so receivers have a day to switch over.
-const rotationOverlap = 24 * time.Hour
-
 func (s *server) rotateSecret(w http.ResponseWriter, r *http.Request) {
 	var req rotateSecretRequest
 	if r.ContentLength != 0 && !decode(w, r, &req) { // the body is optional
@@ -254,7 +250,7 @@ func (s *server) rotateSecret(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnprocessableEntity, "secret must be whsec_ followed by base64 of at least 16 bytes")
 		return
 	}
-	ep, err := s.store.RotateSecret(r.Context(), r.PathValue("app"), r.PathValue("ep"), req.Secret, rotationOverlap)
+	ep, err := s.store.RotateSecret(r.Context(), r.PathValue("app"), r.PathValue("ep"), req.Secret, s.rotationOverlap)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -327,6 +323,23 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		messagesCreated.Inc()
 	}
 	writeJSON(w, status, sendMessageResponse{ID: res.Message.ID, Deliveries: res.Deliveries})
+}
+
+func (s *server) listMessages(w http.ResponseWriter, r *http.Request) {
+	limit, ok := pageLimit(w, r)
+	if !ok {
+		return
+	}
+	ms, err := s.store.ListMessages(r.Context(), r.PathValue("app"), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	out := list[postgres.Message]{Data: ms}
+	if len(ms) == limit {
+		out.NextCursor = ms[len(ms)-1].ID
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *server) listDeliveries(w http.ResponseWriter, r *http.Request) {

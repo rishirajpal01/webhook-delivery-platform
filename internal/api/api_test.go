@@ -129,6 +129,16 @@ func TestSendFlow(t *testing.T) {
 		t.Fatalf("repeat send returned %s (replayed=%q), want %s", again.ID, rec.Header().Get("Idempotent-Replayed"), sent.ID)
 	}
 
+	// The same key with a different payload is a client bug, not a repeat.
+	c.expect(c.do("POST", base+"/messages", `{"event_type":"order.paid","payload":{"order_id":"982"}}`, nil,
+		"Idempotency-Key", "order-981"), http.StatusUnprocessableEntity)
+
+	var ms list[postgres.Message]
+	c.expect(c.do("GET", base+"/messages", "", &ms), http.StatusOK)
+	if len(ms.Data) != 1 || ms.Data[0].ID != sent.ID || ms.Data[0].IdempotencyKey != "order-981" {
+		t.Fatalf("messages = %+v", ms.Data)
+	}
+
 	var ds list[postgres.Delivery]
 	c.expect(c.do("GET", base+"/messages/"+sent.ID+"/deliveries", "", &ds), http.StatusOK)
 	if len(ds.Data) != 1 || ds.Data[0].EndpointID != ep.ID || ds.Data[0].State != "pending" {

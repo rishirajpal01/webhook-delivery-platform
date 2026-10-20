@@ -614,6 +614,54 @@
       }
     },
     "/v1/apps/{app}/messages": {
+      "get": {
+        "operationId": "listMessages",
+        "summary": "List an app's messages, newest first",
+        "tags": [
+          "Messages"
+        ],
+        "parameters": [
+          {
+            "name": "app",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Application id (app_…)"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of messages, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
       "post": {
         "operationId": "sendMessage",
         "summary": "Send an event",
@@ -646,7 +694,7 @@
         },
         "responses": {
           "202": {
-            "description": "The message was stored and fanned out to every subscribed active endpoint",
+            "description": "The message was stored and fanned out to every subscribed active or paused endpoint (a paused endpoint's deliveries wait until it is resumed)",
             "content": {
               "application/json": {
                 "schema": {
@@ -981,7 +1029,7 @@
           "type": "string",
           "maxLength": 255
         },
-        "description": "A repeat with the same key returns the first result instead of creating another"
+        "description": "A repeat with the same key returns the first result instead of creating another. Reusing a key with a different request is refused with 422"
       },
       "Limit": {
         "name": "limit",
@@ -1507,6 +1555,57 @@
         },
         "required": [
           "status"
+        ]
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Message id (msg_…), sent to receivers as webhook-id"
+          },
+          "app_id": {
+            "type": "string"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "payload": {
+            "description": "The JSON payload as sent"
+          },
+          "idempotency_key": {
+            "type": "string",
+            "description": "The Idempotency-Key it was sent with, if any"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "app_id",
+          "event_type",
+          "payload",
+          "created_at"
+        ]
+      },
+      "MessageList": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Pass as ?cursor= for the next page; absent on the last page"
+          }
+        },
+        "required": [
+          "data"
         ]
       }
     }

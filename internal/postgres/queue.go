@@ -41,8 +41,9 @@ type Job struct {
 // Each picked endpoint's row is locked for the claim and claimers skip
 // locked rows, so any number of dispatchers can claim side by side and the
 // limits still hold across all of them. The locks are FOR NO KEY UPDATE, so
-// they do not block foreign-key checks from sends inserting deliveries. Deliveries to paused or disabled
-// endpoints, and to endpoints whose circuit breaker is open, stay pending.
+// they do not block foreign-key checks from sends inserting deliveries.
+// Deliveries to paused or disabled endpoints, and to endpoints whose circuit
+// breaker is open, stay pending.
 func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -62,6 +63,11 @@ func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Jo
 		CROSS JOIN LATERAL (SELECT count(*) AS n FROM (
 		                        SELECT 1 FROM deliveries d
 		                        WHERE d.endpoint_id = e.id AND d.state = 'pending' AND d.next_attempt_at <= now()
+		                        -- The ORDER BY keeps this an index scan of this
+		                        -- endpoint's due work. Without it, under a large
+		                        -- backlog the planner scans the table once per
+		                        -- endpoint, which made each claim ~20x slower.
+		                        ORDER BY d.next_attempt_at
 		                        LIMIT $1) x) due
 		WHERE e.status = 'active' AND e.circuit_open_until IS NULL
 		  AND e.max_in_flight > f.n AND due.n > 0
@@ -400,4 +406,31 @@ func (s *Store) MaintainAttemptPartitions(ctx context.Context, retentionDays int
 			Scan(&dropped)
 	}
 	return created, dropped, err
+}
+
+// DeleteOldMessages deletes messages created more than retentionDays ago
+// whose deliveries have all finished (succeeded or dead), and by cascade
+// their deliveries and attempts. It works in batches so no transaction
+// holds many locks, skips rows another dispatcher is already deleting, and
+// returns how many messages it deleted.
+func (s *Store) DeleteOldMessages(ctx context.Context, retentionDays, batch int) (int, error) {
+	total := 0
+	for {
+		res, err := s.db.ExecContext(ctx, `
+			DELETE FROM messages WHERE id IN (
+				SELECT m.id FROM messages m
+				WHERE m.created_at < now() - $1::integer * interval '1 day'
+				  AND NOT EXISTS (SELECT 1 FROM deliveries d
+				                  WHERE d.message_id = m.id AND d.state IN ('pending', 'in_flight'))
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED)`, retentionDays, batch)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += int(n)
+		if int(n) < batch || ctx.Err() != nil {
+			return total, ctx.Err()
+		}
+	}
 }

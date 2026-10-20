@@ -90,6 +90,7 @@ func TestCrashLosesNothing(t *testing.T) {
 			"ALLOW_PRIVATE_NETWORKS=true",
 			"DISPATCHER_CONCURRENCY=32",
 			"DISPATCHER_LEASE=2s",
+			"DISPATCHER_REQUEST_TIMEOUT=1s",
 		)
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)

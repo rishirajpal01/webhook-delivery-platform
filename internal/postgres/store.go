@@ -2,7 +2,9 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"time"
@@ -19,6 +21,10 @@ var ErrNotFound = errors.New("not found")
 // ErrConflict is returned when a row is not in a state the operation allows,
 // such as replaying a delivery that is still pending.
 var ErrConflict = errors.New("conflict")
+
+// ErrIdempotencyMismatch is returned when an Idempotency-Key is reused with a
+// different request than the one it was first used for.
+var ErrIdempotencyMismatch = errors.New("idempotency key reused with a different request")
 
 // Endpoint statuses.
 const (
@@ -141,6 +147,9 @@ func (s *Store) CreateAppIdempotent(ctx context.Context, name, key string) (a Ap
 	err = s.db.QueryRowContext(ctx,
 		`SELECT id, name, created_at FROM applications WHERE idempotency_key = $1`, key).
 		Scan(&a.ID, &a.Name, &a.CreatedAt)
+	if err == nil && a.Name != name {
+		return App{}, false, ErrIdempotencyMismatch
+	}
 	return a, true, err
 }
 
@@ -158,12 +167,13 @@ func (s *Store) GetApp(ctx context.Context, appID string) (App, error) {
 const endpointColumns = `id, app_id, url, secret, event_types, status,
 	max_in_flight, coalesce(rate_limit, 0), consecutive_failures, failing_since, circuit_open_until, disabled_at, created_at, updated_at`
 
-func scanEndpoint(row interface{ Scan(...any) error }) (Endpoint, error) {
+// scanEndpoint reads endpointColumns, then any extra columns into extra.
+func scanEndpoint(row interface{ Scan(...any) error }, extra ...any) (Endpoint, error) {
 	var e Endpoint
-	err := row.Scan(&e.ID, &e.AppID, &e.URL, &e.Secret,
+	err := row.Scan(append([]any{&e.ID, &e.AppID, &e.URL, &e.Secret,
 		pgtype.NewMap().SQLScanner(&e.EventTypes), &e.Status, &e.MaxInFlight, &e.RateLimit,
 		&e.ConsecutiveFailures, &e.FailingSince, &e.CircuitOpenUntil, &e.DisabledAt,
-		&e.CreatedAt, &e.UpdatedAt)
+		&e.CreatedAt, &e.UpdatedAt}, extra...)...)
 	return e, err
 }
 
@@ -180,22 +190,38 @@ func (s *Store) CreateEndpointIdempotent(ctx context.Context, e Endpoint, key st
 	if e.EventTypes == nil {
 		e.EventTypes = []string{}
 	}
+	fingerprint := endpointFingerprint(e)
 	row := s.db.QueryRowContext(ctx, `
-		INSERT INTO endpoints (id, app_id, url, secret, event_types, max_in_flight, rate_limit, idempotency_key)
-		SELECT $1, $2, $3, $4, $5, coalesce(nullif($6, 0), 4), nullif($7, 0), nullif($8, '')
+		INSERT INTO endpoints (id, app_id, url, secret, event_types, max_in_flight, rate_limit,
+		                       idempotency_key, idempotency_fingerprint)
+		SELECT $1, $2, $3, $4, $5, coalesce(nullif($6, 0), 4), nullif($7, 0), nullif($8, ''), nullif($9, '')
 		WHERE EXISTS (SELECT 1 FROM applications WHERE id = $2)
 		ON CONFLICT (app_id, idempotency_key) DO NOTHING
 		RETURNING `+endpointColumns,
-		id.New(id.Endpoint), e.AppID, e.URL, e.Secret, e.EventTypes, e.MaxInFlight, e.RateLimit, key)
+		id.New(id.Endpoint), e.AppID, e.URL, e.Secret, e.EventTypes, e.MaxInFlight, e.RateLimit,
+		key, fingerprint)
 	created, err = scanEndpoint(row)
 	if !errors.Is(err, sql.ErrNoRows) || key == "" {
 		return created, false, notFound(err)
 	}
 	// No row: either the app does not exist or the key was used before.
+	var same bool
 	row = s.db.QueryRowContext(ctx,
-		`SELECT `+endpointColumns+` FROM endpoints WHERE app_id = $1 AND idempotency_key = $2`, e.AppID, key)
-	created, err = scanEndpoint(row)
+		`SELECT `+endpointColumns+`, coalesce(idempotency_fingerprint = $3, true)
+		 FROM endpoints WHERE app_id = $1 AND idempotency_key = $2`, e.AppID, key, fingerprint)
+	created, err = scanEndpoint(row, &same)
+	if err == nil && !same {
+		return Endpoint{}, false, ErrIdempotencyMismatch
+	}
 	return created, err == nil, notFound(err)
+}
+
+// endpointFingerprint identifies what a create asked for. A secret the
+// caller left out is generated anew on every try, so it is not part of it.
+func endpointFingerprint(e Endpoint) string {
+	b, _ := json.Marshal([]any{e.URL, e.EventTypes, e.MaxInFlight, e.RateLimit})
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // GetEndpoint returns one endpoint of an app.
@@ -256,6 +282,10 @@ func (s *Store) UpdateEndpoint(ctx context.Context, appID, endpointID string, p 
 		RETURNING `+endpointColumns,
 		appID, endpointID, p.URL, p.EventTypes, p.Status, p.MaxInFlight, p.RateLimit)
 	e, err := scanEndpoint(row)
+	if err == nil && e.Status == EndpointActive && p.Status != nil {
+		// Resuming makes the deliveries held while paused claimable.
+		err = notifyDue(ctx, s.db)
+	}
 	return e, notFound(err)
 }
 
@@ -333,7 +363,7 @@ func (s *Store) CreateMessage(ctx context.Context, m Message) (SendResult, error
 	if errors.Is(err, sql.ErrNoRows) {
 		// The key was used before. ON CONFLICT waited for that insert to
 		// commit, so the original row is visible now.
-		return s.existingMessage(ctx, tx, m.AppID, m.IdempotencyKey)
+		return s.existingMessage(ctx, tx, m)
 	}
 	if err != nil {
 		return SendResult{}, err
@@ -349,37 +379,99 @@ func (s *Store) CreateMessage(ctx context.Context, m Message) (SendResult, error
 	return SendResult{Message: m, Deliveries: n}, nil
 }
 
-// fanOut creates one pending delivery of a message per active endpoint of
-// the app subscribed to its event type, and returns how many. Endpoints with
-// an empty filter receive every type only when wildcard is true.
+// fanOut creates one pending delivery of a message per active or paused
+// endpoint of the app subscribed to its event type, and returns how many.
+// A paused endpoint's deliveries wait until it is resumed; a disabled
+// endpoint gets none. Endpoints with an empty filter receive every type only
+// when wildcard is true.
 func fanOut(ctx context.Context, tx *sql.Tx, messageID, appID, eventType string, wildcard bool) (int, error) {
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO deliveries (id, message_id, endpoint_id)
 		SELECT 'del_' || replace(gen_random_uuid()::text, '-', ''), $1, e.id
 		FROM endpoints e
-		WHERE e.app_id = $2 AND e.status = 'active'
+		WHERE e.app_id = $2 AND e.status IN ('active', 'paused')
 		  AND (($4::boolean AND cardinality(e.event_types) = 0) OR $3 = ANY (e.event_types))`,
 		messageID, appID, eventType, wildcard)
 	if err != nil {
 		return 0, err
 	}
 	n, err := res.RowsAffected()
-	return int(n), err
+	if err != nil || n == 0 {
+		return int(n), err
+	}
+	return int(n), notifyDue(ctx, tx)
 }
 
-func (s *Store) existingMessage(ctx context.Context, tx *sql.Tx, appID, key string) (SendResult, error) {
+// DueChannel is the channel dispatchers LISTEN on. A notification means new
+// deliveries may be due; it carries no payload.
+const DueChannel = "webhookd_due"
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// notifyDue wakes listening dispatchers. Inside a transaction the
+// notification is sent on commit, and repeats within it are folded into one.
+func notifyDue(ctx context.Context, q execer) error {
+	_, err := q.ExecContext(ctx, `SELECT pg_notify($1, '')`, DueChannel)
+	return err
+}
+
+// existingMessage returns the message an earlier send with m's idempotency
+// key created, or ErrIdempotencyMismatch if that send had another event type
+// or payload.
+func (s *Store) existingMessage(ctx context.Context, tx *sql.Tx, m Message) (SendResult, error) {
 	var (
 		r       = SendResult{Duplicate: true}
 		payload string
+		same    bool
 	)
 	err := tx.QueryRowContext(ctx, `
 		SELECT m.id, m.app_id, m.event_type, m.payload::text, m.idempotency_key, m.created_at,
-		       (SELECT count(*) FROM deliveries d WHERE d.message_id = m.id)
-		FROM messages m WHERE m.app_id = $1 AND m.idempotency_key = $2`, appID, key).
+		       (SELECT count(*) FROM deliveries d WHERE d.message_id = m.id),
+		       m.event_type = $3 AND m.payload = $4::jsonb
+		FROM messages m WHERE m.app_id = $1 AND m.idempotency_key = $2`,
+		m.AppID, m.IdempotencyKey, m.EventType, string(m.Payload)).
 		Scan(&r.Message.ID, &r.Message.AppID, &r.Message.EventType, &payload,
-			&r.Message.IdempotencyKey, &r.Message.CreatedAt, &r.Deliveries)
+			&r.Message.IdempotencyKey, &r.Message.CreatedAt, &r.Deliveries, &same)
+	if err == nil && !same {
+		return SendResult{}, ErrIdempotencyMismatch
+	}
 	r.Message.Payload = json.RawMessage(payload)
 	return r, err
+}
+
+// ListMessages returns up to limit of an app's messages, newest first,
+// starting after the message the cursor names (empty for the first page).
+func (s *Store) ListMessages(ctx context.Context, appID, after string, limit int) ([]Message, error) {
+	if _, err := s.GetApp(ctx, appID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT m.id, m.app_id, m.event_type, m.payload::text, coalesce(m.idempotency_key, ''), m.created_at
+		FROM messages m
+		WHERE m.app_id = $1
+		  AND ($2 = '' OR (m.created_at, m.id) < (SELECT c.created_at, c.id FROM messages c
+		                                          WHERE c.app_id = $1 AND c.id = $2))
+		ORDER BY m.created_at DESC, m.id DESC
+		LIMIT $3`, appID, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		var (
+			m       Message
+			payload string
+		)
+		if err := rows.Scan(&m.ID, &m.AppID, &m.EventType, &payload, &m.IdempotencyKey, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		m.Payload = json.RawMessage(payload)
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 // --- replay ---
@@ -405,6 +497,9 @@ func (s *Store) ReplayDelivery(ctx context.Context, appID, deliveryID string) (D
 		  AND d.state IN ('dead', 'succeeded')
 		RETURNING `+deliveryColumns, appID, deliveryID)
 	d, err := scanDelivery(row)
+	if err == nil {
+		return d, notifyDue(ctx, s.db)
+	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return d, err
 	}
@@ -434,7 +529,10 @@ func (s *Store) ReplayEndpoint(ctx context.Context, appID, endpointID string, si
 		return 0, err
 	}
 	n, err := res.RowsAffected()
-	return int(n), err
+	if err != nil || n == 0 {
+		return int(n), err
+	}
+	return int(n), notifyDue(ctx, s.db)
 }
 
 // --- delivery log ---

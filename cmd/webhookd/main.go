@@ -46,7 +46,7 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := postgres.Open(ctx, cfg.DatabaseURL)
+	db, err := postgres.Open(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
 		return err
 	}
@@ -65,7 +65,7 @@ func run(logger *slog.Logger) error {
 	// Every role serves health checks and metrics; only the api role serves /v1.
 	handler := api.NewOpsHandler(db, logger)
 	if cfg.RunsAPI() {
-		handler = api.NewHandler(db, store, cfg.APIKeyHash, logger)
+		handler = api.NewHandler(db, store, cfg.APIKeyHash, logger, api.WithRotationOverlap(cfg.SecretRotationOverlap))
 	}
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	running++
@@ -82,8 +82,20 @@ func run(logger *slog.Logger) error {
 		d := dispatcher.New(store, dispatcher.Config{
 			Concurrency:          cfg.DispatcherConcurrency,
 			Lease:                cfg.DispatcherLease,
+			RequestTimeout:       cfg.DispatcherRequestTimeout,
+			PollInterval:         cfg.DispatcherPollInterval,
+			Listen:               cfg.DispatcherListen,
+			Schedule:             cfg.RetrySchedule,
+			Jitter:               &cfg.RetryJitter,
 			AllowPrivateNetworks: cfg.AllowPrivateNetworks,
 			AttemptRetentionDays: cfg.AttemptRetentionDays,
+			MessageRetentionDays: cfg.MessageRetentionDays,
+			Health: postgres.HealthPolicy{
+				FailureThreshold: cfg.CircuitFailureThreshold,
+				CooldownBase:     cfg.CircuitCooldown,
+				CooldownMax:      cfg.CircuitCooldownMax,
+				DisableAfter:     cfg.EndpointDisableAfter,
+			},
 		}, logger)
 		if cfg.AllowPrivateNetworks {
 			logger.Warn("SSRF guard is off: deliveries may reach private networks")

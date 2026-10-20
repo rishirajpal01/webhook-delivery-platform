@@ -16,16 +16,20 @@ var DefaultSchedule = []time.Duration{
 	12 * time.Hour,
 }
 
+// DefaultJitter is how far, as a fraction, each retry delay moves either way
+// by default.
+const DefaultJitter = 0.25
+
 // retryDelay returns how long to wait after the given number of failed
 // attempts, or false when the schedule is used up. Each delay is moved by up
-// to ±25% at random (rnd returns [0,1)), so retries from one outage spread
+// to ±jitter at random (rnd returns [0,1)), so retries from one outage spread
 // out instead of arriving together, while the total window stays about the
 // same as the schedule says.
-func retryDelay(schedule []time.Duration, failedAttempts int, rnd func() float64) (time.Duration, bool) {
+func retryDelay(schedule []time.Duration, failedAttempts int, jitter float64, rnd func() float64) (time.Duration, bool) {
 	if failedAttempts < 1 || failedAttempts > len(schedule) {
 		return 0, false
 	}
 	base := schedule[failedAttempts-1]
-	factor := 0.75 + 0.5*rnd()
+	factor := 1 - jitter + 2*jitter*rnd()
 	return time.Duration(float64(base) * factor), true
 }

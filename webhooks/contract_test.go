@@ -30,7 +30,7 @@ func TestSDKMatchesOpenAPI(t *testing.T) {
 	responses := map[string]any{
 		"App": App{}, "Endpoint": Endpoint{}, "Delivery": Delivery{}, "Attempt": Attempt{},
 		"EndpointList": Page[Endpoint]{}, "DeliveryList": Page[Delivery]{}, "AttemptList": Page[Attempt]{},
-		"SendMessageResponse": SendResult{},
+		"SendMessageResponse": SendResult{}, "Message": Message{}, "MessageList": Page[Message]{},
 	}
 	requests := map[string]any{
 		"CreateAppRequest": CreateAppRequest{}, "CreateEndpointRequest": CreateEndpointRequest{},

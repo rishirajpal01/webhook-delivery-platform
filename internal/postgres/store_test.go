@@ -104,7 +104,7 @@ func TestAppsAndEndpoints(t *testing.T) {
 	}
 }
 
-func TestCreateMessageFansOutToMatchingActiveEndpoints(t *testing.T) {
+func TestCreateMessageFansOutToMatchingEndpoints(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 	app := mustApp(t, s)
@@ -112,15 +112,17 @@ func TestCreateMessageFansOutToMatchingActiveEndpoints(t *testing.T) {
 	all := mustEndpoint(t, s, app.ID)                        // every event type
 	match := mustEndpoint(t, s, app.ID, "order.paid", "x.y") // subscribed
 	mustEndpoint(t, s, app.ID, "order.refunded")             // not subscribed
-	paused := mustEndpoint(t, s, app.ID)                     // paused below
-	p := EndpointPaused
-	if _, err := s.UpdateEndpoint(ctx, app.ID, paused.ID, EndpointPatch{Status: &p}); err != nil {
-		t.Fatal(err)
+	paused := mustEndpoint(t, s, app.ID)                     // paused below: deliveries are held
+	disabled := mustEndpoint(t, s, app.ID)                   // disabled below: gets none
+	for id, status := range map[string]string{paused.ID: EndpointPaused, disabled.ID: EndpointDisabled} {
+		if _, err := s.UpdateEndpoint(ctx, app.ID, id, EndpointPatch{Status: &status}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	r := mustSend(t, s, app.ID, "order.paid")
-	if r.Deliveries != 2 || r.Duplicate {
-		t.Fatalf("send = %+v, want 2 deliveries", r)
+	if r.Deliveries != 3 || r.Duplicate {
+		t.Fatalf("send = %+v, want 3 deliveries", r)
 	}
 	ds, err := s.ListDeliveries(ctx, app.ID, r.Message.ID, "", 100)
 	if err != nil {
@@ -133,7 +135,7 @@ func TestCreateMessageFansOutToMatchingActiveEndpoints(t *testing.T) {
 			t.Errorf("delivery state = %s", d.State)
 		}
 	}
-	if len(got) != 2 || !got[all.ID] || !got[match.ID] {
+	if len(got) != 3 || !got[all.ID] || !got[match.ID] || !got[paused.ID] {
 		t.Fatalf("deliveries went to %v", got)
 	}
 
@@ -181,6 +183,22 @@ func TestCreateMessageIdempotency(t *testing.T) {
 	}
 	if originals != 1 {
 		t.Fatalf("%d sends created a message, want 1", originals)
+	}
+
+	// The same key with another payload or event type is refused.
+	for _, m := range []Message{
+		{AppID: app.ID, EventType: "order.paid", Payload: json.RawMessage(`{"a":2}`), IdempotencyKey: "k1"},
+		{AppID: app.ID, EventType: "order.refunded", Payload: json.RawMessage(`{"a":1}`), IdempotencyKey: "k1"},
+	} {
+		if _, err := s.CreateMessage(ctx, m); !errors.Is(err, ErrIdempotencyMismatch) {
+			t.Errorf("reused key with %s %s: err %v, want ErrIdempotencyMismatch", m.EventType, m.Payload, err)
+		}
+	}
+	// Equal JSON written differently is the same request.
+	same := msg
+	same.Payload = json.RawMessage(`{ "a" : 1 }`)
+	if r, err := s.CreateMessage(ctx, same); err != nil || !r.Duplicate {
+		t.Fatalf("reformatted payload = %+v, %v; want the first message", r, err)
 	}
 
 	// The same key in another app is independent.
@@ -369,6 +387,24 @@ func TestIdempotentCreates(t *testing.T) {
 	}
 	if eps, _ := s.ListEndpoints(ctx, a1.ID, "", 10); len(eps) != 1 {
 		t.Fatalf("%d endpoints, want 1", len(eps))
+	}
+	// A retry stays the same request after the endpoint is changed, and a
+	// generated secret is not part of it; another URL is a different one.
+	newURL := "https://example.com/moved"
+	if _, err := s.UpdateEndpoint(ctx, a1.ID, e1.ID, EndpointPatch{URL: &newURL}); err != nil {
+		t.Fatal(err)
+	}
+	retry := ep
+	retry.Secret = "whsec_b3RoZXJvdGhlcm90aGVyIQ=="
+	if _, dup, err := s.CreateEndpointIdempotent(ctx, retry, "ep-key"); err != nil || !dup {
+		t.Fatalf("retry after update: dup %v, err %v", dup, err)
+	}
+	retry.URL = newURL
+	if _, _, err := s.CreateEndpointIdempotent(ctx, retry, "ep-key"); !errors.Is(err, ErrIdempotencyMismatch) {
+		t.Fatalf("other URL: err %v, want ErrIdempotencyMismatch", err)
+	}
+	if _, _, err := s.CreateAppIdempotent(ctx, "globex", "app-key"); !errors.Is(err, ErrIdempotencyMismatch) {
+		t.Fatalf("other app name: err %v, want ErrIdempotencyMismatch", err)
 	}
 	// Keys are per app, and a missing app is still not found.
 	other := mustApp(t, s)

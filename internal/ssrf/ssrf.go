@@ -26,6 +26,9 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),   // reserved, includes broadcast
 	netip.MustParsePrefix("64:ff9b::/96"),  // NAT64, can embed private IPv4
 	netip.MustParsePrefix("2002::/16"),     // 6to4, can embed private IPv4
+	netip.MustParsePrefix("::/96"),         // IPv4-compatible (deprecated), embeds IPv4
+	netip.MustParsePrefix("2001::/32"),     // Teredo, embeds IPv4
+	netip.MustParsePrefix("2001:db8::/32"), // documentation
 }
 
 // IsPublic reports whether addr is a globally routable unicast address.

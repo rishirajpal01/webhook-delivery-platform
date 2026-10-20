@@ -23,13 +23,10 @@ var migrationFiles embed.FS
 // same in every process.
 const migrateLockID = 7_202_610_11
 
-// maxConns caps connections per process. It sits above the default
-// dispatcher concurrency (16) so API requests still get connections while
-// every dispatcher slot is busy.
-const maxConns = 40
-
-// Open connects to Postgres and checks the connection works.
-func Open(ctx context.Context, url string) (*sql.DB, error) {
+// Open connects to Postgres and checks the connection works. maxConns caps
+// the process's connections; keep it above the dispatcher concurrency so API
+// requests still get connections while every dispatcher slot is busy.
+func Open(ctx context.Context, url string, maxConns int) (*sql.DB, error) {
 	db, err := sql.Open("pgx", url)
 	if err != nil {
 		return nil, err

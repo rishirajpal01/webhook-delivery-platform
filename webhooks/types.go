@@ -38,6 +38,17 @@ type Endpoint struct {
 	UpdatedAt           time.Time  `json:"updated_at"`
 }
 
+// Message is one event sent to an app.
+type Message struct {
+	// ID is sent to receivers as the webhook-id header.
+	ID             string          `json:"id"`
+	AppID          string          `json:"app_id"`
+	EventType      string          `json:"event_type"`
+	Payload        json.RawMessage `json:"payload"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
 // Delivery is one message going to one endpoint.
 type Delivery struct {
 	ID         string `json:"id"`

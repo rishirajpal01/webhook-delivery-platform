@@ -71,11 +71,20 @@ type Config struct {
 	Lease          time.Duration   // how long a claim is held; default 30s
 	RequestTimeout time.Duration   // per HTTP request; default 15s
 	Schedule       []time.Duration // retry delays; default DefaultSchedule
+	// Jitter is the fraction each retry delay moves either way at random;
+	// nil means DefaultJitter, and 0 turns jitter off.
+	Jitter *float64
 	// AllowPrivateNetworks turns off the SSRF guard. Local development only.
 	AllowPrivateNetworks bool
 	// AttemptRetentionDays is how many days of the attempt log to keep;
 	// 0 keeps everything.
 	AttemptRetentionDays int
+	// MessageRetentionDays is how many days to keep messages whose
+	// deliveries have all finished; 0 keeps everything.
+	MessageRetentionDays int
+	// Listen makes the dispatcher LISTEN for new work so it starts sending
+	// at once rather than on the next poll.
+	Listen bool
 	// Health decides when an endpoint's circuit breaker trips and when it is
 	// disabled. Defaults: trip after 10 failures in a row, cool down for 1m
 	// doubling to 1h between probes, disable after 5 days of failure.
@@ -97,6 +106,10 @@ func (c *Config) setDefaults() {
 	}
 	if c.Schedule == nil {
 		c.Schedule = DefaultSchedule
+	}
+	if c.Jitter == nil {
+		j := DefaultJitter
+		c.Jitter = &j
 	}
 	if c.Health.FailureThreshold <= 0 {
 		c.Health.FailureThreshold = 10
@@ -120,6 +133,8 @@ type Dispatcher struct {
 	logger    *slog.Logger
 	rnd       func() float64
 	slotFreed chan struct{}
+	// due is signalled when Postgres notifies that new work may be due.
+	due chan struct{}
 }
 
 // New returns a dispatcher. Call Run to start it.
@@ -132,6 +147,7 @@ func New(store *postgres.Store, cfg Config, logger *slog.Logger) *Dispatcher {
 		logger:    logger,
 		rnd:       rand.Float64,
 		slotFreed: make(chan struct{}, 1),
+		due:       make(chan struct{}, 1),
 	}
 }
 
@@ -177,9 +193,12 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	}()
 
 	background.Go(func() { d.releaseExpiredLoop(ctx) })
+	if d.cfg.Listen {
+		background.Go(func() { d.listenLoop(ctx) })
+	}
 	background.Go(func() {
-		for sleep(ctx, time.Hour); ctx.Err() == nil; sleep(ctx, time.Hour) {
-			d.maintainPartitions(ctx)
+		for ; ctx.Err() == nil; sleep(ctx, time.Hour) {
+			d.maintain(ctx)
 		}
 	})
 
@@ -227,6 +246,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 			case <-d.slotFreed:
+			case <-d.due:
 			case <-t.C:
 			}
 			t.Stop()
@@ -253,8 +273,22 @@ func (d *Dispatcher) claim(ctx context.Context, free int) ([]postgres.Job, error
 	return jobs, nil
 }
 
-// maintainPartitions creates the coming days' attempt log partitions and
-// drops the ones past retention.
+// maintain creates the coming days' attempt log partitions, drops the ones
+// past retention, and deletes finished messages past retention.
+func (d *Dispatcher) maintain(ctx context.Context) {
+	d.maintainPartitions(ctx)
+	if d.cfg.MessageRetentionDays <= 0 {
+		return
+	}
+	n, err := d.store.DeleteOldMessages(ctx, d.cfg.MessageRetentionDays, 1000)
+	if err != nil && ctx.Err() == nil {
+		d.logger.Error("message retention failed", "err", err)
+	}
+	if n > 0 {
+		d.logger.Info("old messages deleted", "count", n)
+	}
+}
+
 func (d *Dispatcher) maintainPartitions(ctx context.Context) {
 	created, dropped, err := d.store.MaintainAttemptPartitions(ctx, d.cfg.AttemptRetentionDays)
 	if err != nil {
@@ -265,6 +299,26 @@ func (d *Dispatcher) maintainPartitions(ctx context.Context) {
 	}
 	if created > 0 || dropped > 0 {
 		d.logger.Info("attempt partitions maintained", "created", created, "dropped", dropped)
+	}
+}
+
+// listenLoop keeps a LISTEN connection open so new messages and replays wake
+// the claim loop at once; the poll still runs in case a notification is
+// missed while reconnecting.
+func (d *Dispatcher) listenLoop(ctx context.Context) {
+	wake := func() {
+		select {
+		case d.due <- struct{}{}:
+		default:
+		}
+	}
+	for ctx.Err() == nil {
+		err := d.store.ListenDue(ctx, wake)
+		if ctx.Err() != nil {
+			return
+		}
+		d.logger.Warn("listen for new work failed; polling until it reconnects", "err", err)
+		sleep(ctx, 5*time.Second)
 	}
 }
 
@@ -298,7 +352,7 @@ func (d *Dispatcher) process(ctx context.Context, j postgres.Job) {
 	ok := attempt.StatusCode != nil && *attempt.StatusCode >= 200 && *attempt.StatusCode < 300
 
 	o := postgres.Outcome{Attempt: attempt}
-	switch delay, retry := retryDelay(d.cfg.Schedule, j.AttemptCount+1, d.rnd); {
+	switch delay, retry := retryDelay(d.cfg.Schedule, j.AttemptCount+1, *d.cfg.Jitter, d.rnd); {
 	case ok:
 		o.NextState = postgres.DeliverySucceeded
 	case retry:

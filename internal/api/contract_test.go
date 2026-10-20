@@ -41,6 +41,8 @@ func TestServerMatchesOpenAPI(t *testing.T) {
 		"Endpoint":               postgres.Endpoint{},
 		"Delivery":               postgres.Delivery{},
 		"Attempt":                postgres.Attempt{},
+		"Message":                postgres.Message{},
+		"MessageList":            list[postgres.Message]{},
 		"EndpointList":           list[postgres.Endpoint]{},
 		"DeliveryList":           list[postgres.Delivery]{},
 		"AttemptList":            list[postgres.Attempt]{},

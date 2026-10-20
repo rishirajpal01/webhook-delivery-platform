@@ -24,9 +24,19 @@ type Pinger interface {
 }
 
 type server struct {
-	store   *postgres.Store
-	keyHash [32]byte
-	logger  *slog.Logger
+	store           *postgres.Store
+	keyHash         [32]byte
+	logger          *slog.Logger
+	rotationOverlap time.Duration
+}
+
+// Option changes a default of NewHandler.
+type Option func(*server)
+
+// WithRotationOverlap sets how long a rotated-out secret keeps signing
+// requests alongside the new one (default 24h).
+func WithRotationOverlap(d time.Duration) Option {
+	return func(s *server) { s.rotationOverlap = d }
 }
 
 // NewOpsHandler serves only the operational routes, for processes that
@@ -45,8 +55,11 @@ func NewOpsHandler(db Pinger, logger *slog.Logger) http.Handler {
 // NewHandler serves the operational routes plus the API. Everything under
 // /v1 requires "Authorization: Bearer <key>", where keyHash is the key's
 // SHA-256.
-func NewHandler(db Pinger, store *postgres.Store, keyHash [32]byte, logger *slog.Logger) http.Handler {
-	s := &server{store: store, keyHash: keyHash, logger: logger}
+func NewHandler(db Pinger, store *postgres.Store, keyHash [32]byte, logger *slog.Logger, opts ...Option) http.Handler {
+	s := &server{store: store, keyHash: keyHash, logger: logger, rotationOverlap: 24 * time.Hour}
+	for _, o := range opts {
+		o(s)
+	}
 	mux := http.NewServeMux()
 	addOpsRoutes(mux, db, logger)
 
@@ -79,6 +92,7 @@ func (s *server) routes() []route {
 		{"POST /v1/apps/{app}/endpoints/{ep}/enable", s.enableEndpoint},
 		{"POST /v1/apps/{app}/endpoints/{ep}/replay", s.replayEndpoint},
 		{"POST /v1/apps/{app}/messages", s.sendMessage},
+		{"GET /v1/apps/{app}/messages", s.listMessages},
 		{"GET /v1/apps/{app}/messages/{msg}/deliveries", s.listDeliveries},
 		{"GET /v1/apps/{app}/deliveries/{del}/attempts", s.listAttempts},
 		{"POST /v1/apps/{app}/deliveries/{del}/replay", s.replayDelivery},
@@ -125,6 +139,10 @@ func (s *server) requireKey(next http.Handler) http.Handler {
 func (s *server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, postgres.ErrNotFound) {
 		problem(w, http.StatusNotFound, "not found")
+		return
+	}
+	if errors.Is(err, postgres.ErrIdempotencyMismatch) {
+		problem(w, http.StatusUnprocessableEntity, "Idempotency-Key was already used with a different request")
 		return
 	}
 	if errors.Is(err, postgres.ErrConflict) {

@@ -39,6 +39,7 @@ Commands:
   endpoints rotate-secret APP EP [-secret whsec_…]
   endpoints replay APP EP -since TIME   (RFC 3339, or a duration such as 2h meaning that long ago)
   send APP EVENT_TYPE PAYLOAD_JSON [-idempotency-key K]
+  messages APP [-limit N] [-cursor C]   (newest first)
   deliveries APP MSG [-limit N] [-cursor C] [-wait DURATION]
   attempts APP DEL [-limit N] [-cursor C]
   replay APP DEL
@@ -211,6 +212,11 @@ func dispatch(ctx context.Context, c *webhooks.Client, out output, args []string
 		return out.print(c.SendMessage(ctx, pos[0], webhooks.SendMessageRequest{
 			EventType: pos[1], Payload: json.RawMessage(pos[2]), IdempotencyKey: *idemKey,
 		}))
+	case "messages":
+		if err := want(1); err != nil {
+			return 0, err
+		}
+		return out.print(c.ListMessages(ctx, pos[0], page))
 	case "deliveries":
 		if err := want(2); err != nil {
 			return 0, err

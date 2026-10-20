@@ -165,6 +165,13 @@ func (c *Client) SendMessage(ctx context.Context, appID string, req SendMessageR
 	return &out, err
 }
 
+// ListMessages returns a page of an app's messages, newest first.
+func (c *Client) ListMessages(ctx context.Context, appID string, opts ListOptions) (*Page[Message], error) {
+	var out Page[Message]
+	_, err := c.do(ctx, http.MethodGet, path("v1/apps", appID, "messages"), opts.query(), "", nil, &out)
+	return &out, err
+}
+
 // ListDeliveries returns a page of a message's deliveries, ordered by id.
 func (c *Client) ListDeliveries(ctx context.Context, appID, messageID string, opts ListOptions) (*Page[Delivery], error) {
 	var out Page[Delivery]
