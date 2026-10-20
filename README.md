@@ -10,7 +10,7 @@ One Go binary plus Postgres. No Kafka, Redis or Kubernetes required.
 <a href="docs/architecture/README.md">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/architecture-dark.png" />
-    <img src="docs/architecture/architecture-light.png" alt="Architecture: your product sends to webhookd's API, which writes the message and its deliveries to Postgres in one transaction; dispatchers claim deliveries with SKIP LOCKED and a lease, record each attempt in a day-partitioned log, and send signed requests through an SSRF guard to receivers." />
+    <img src="docs/architecture/architecture-light.png" alt="Architecture: your product sends to webhookd's API, which writes the message and its deliveries to Postgres in one transaction; dispatchers, woken by LISTEN/NOTIFY, claim deliveries with SKIP LOCKED and a lease, record each attempt in a day-partitioned log, and send signed requests through an SSRF guard to receivers." />
   </picture>
 </a>
 
