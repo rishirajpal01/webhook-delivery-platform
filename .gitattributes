@@ -1,2 +1,3 @@
 docs/architecture/** linguist-documentation
 docs/architecture/index.html linguist-generated
+site/** linguist-documentation
